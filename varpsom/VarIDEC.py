@@ -1,0 +1,423 @@
+"""
+Script of the VarIDEC model.
+"""
+
+import uuid
+from datetime import date
+import tensorflow as tf
+from tqdm import tqdm
+import sacred
+from sacred.stflow import LogFileWriter
+from sklearn.model_selection import train_test_split
+import numpy as np
+from sklearn import metrics
+from VarIDEC_model import VarIDEC
+from utils import cluster_purity
+
+ex = sacred.Experiment("hyperopt")
+ex.observers.append(sacred.observers.FileStorageObserver.create("../sacred_runs"))
+ex.captured_out_filter = sacred.utils.apply_backspaces_and_linefeeds
+
+@ex.config
+def ex_config():
+    """Sacred configuration for the experiment.
+    Params:
+        num_epochs (int): Number of training epochs.
+        patience (int): Patience for the early stopping.
+        batch_size (int): Batch size for the training.
+        latent_dim (int): Dimensionality of the VarIDEC's latent space.
+        num_clusters (int): Number of clusters.
+        learning_rate (float): Learning rate for the optimization.
+        alpha (float): Student's t-distribution parameter.
+        gamma (float): Weight of the VarIDEC clustering loss.
+        theta (float): Weight for the VAE loss.
+        epochs_pretrain (int): Number of VAE pretraining epochs.
+        decay_factor (float): Factor for the learning rate decay.
+        decay_steps (float): Number of steps for the learning rate decay.
+        name (string): Name of the experiment.
+        ex_name (string): Unique name of this particular run.
+        logdir (path): Directory for the experiment logs.
+        modelpath (path): Path for the model checkpoints.
+        data_set (string): Data set for the training.
+        validation (bool): If "True" validation set is used for evaluation, otherwise test set is used.
+        dropout (float): Dropout factor for the feed-forward layers of the VAE.
+        prior_var (float): Multiplier of the diagonal variance of the VAE multivariate gaussian prior.
+        prior (float): Weight of the regularization term of the ELBO.
+        convolution (bool): Indicator if the model use convolutional layers (True) or feed-forward layers (False).
+        val_epochs (bool): If "True" clustering results are saved every 10 epochs on a output file.
+        more_runs (bool): Indicator whether to run the job once (False) or multiple times (True) outputting mean and
+                          variance.
+    """
+    num_epochs = 300
+    batch_size = 300
+    latent_dim = 100
+    num_clusters = 64
+    learning_rate = 0.001
+    alpha = 10.0
+    gamma = 20.0
+    theta = 1
+    epochs_pretrain = 10
+    decay_factor = 0.99
+    decay_steps = 5000
+    name = ex.get_experiment_info()["name"]
+    ex_name = "{}_{}_{}_{}_{}".format(name, latent_dim, num_clusters, str(date.today()),
+                                         uuid.uuid4().hex[:5])
+    logdir = "../logs/{}".format(ex_name)
+    modelpath = "../models/{}/{}.ckpt".format(ex_name, ex_name)
+    data_set = "MNIST"
+    validation = False
+    dropout = 0.4
+    prior_var = 1
+    prior = 0.5
+    convolution = False
+    val_epochs = False
+    more_runs = False
+
+@ex.capture
+def get_data_generator(data_train, data_val, labels_train, labels_val, data_test, labels_test):
+    """Creates a data generator for the training.
+    Args:
+        data_train: training set.
+        data_val: validation set.
+        labels_train: labels of the training set.
+        labels_val: labels of the validation set.
+        data_test: test set.
+        labels_test: labels of the test set.
+
+    Returns:
+        generator: Data generator for the batches."""
+
+
+    def batch_generator(mode="train", batch_size=300):
+        """Generator for the data batches.
+
+        Args:
+            mode (str): Mode in ['train', 'val', 'test'] that decides which data set the generator
+                samples from (default: 'train').
+            batch_size (int): The size of the batches (default: 300).
+
+        Yields:
+            np.array: Data batch.
+            np.array: Labels batch.
+            int: Offset of the batch in dataset.
+        """
+        assert mode in ["train", "val", "test"], "The mode should be in {train, val, test}."
+        if mode == "train":
+            images = data_train.copy()
+            labels = labels_train.copy()
+        elif mode == "val":
+            images = data_val.copy()
+            labels = labels_val.copy()
+        elif mode == "test":
+            images = data_test.copy()
+            labels = labels_test.copy()
+
+        while True:
+            for i in range(len(images) // batch_size):
+                yield images[i * batch_size:(i + 1) * batch_size], labels[i * batch_size:(i + 1) * batch_size], i
+
+    return batch_generator
+
+
+@ex.capture
+def train_model(model, data_train, data_val, generator, lr_val, num_epochs, batch_size, logdir, ex_name,
+                val_epochs, modelpath, learning_rate, epochs_pretrain, latent_dim, num_clusters):
+
+    """Trains the VarPSOM model.
+    Args:
+        model (VarPSOM): VarPSOM model to train.
+        data_train (np.array): Training set.
+        data_val (np.array): Validation/test set.
+        generator (generator): Data generator for the batches.
+        lr_val (tf.Tensor): Placeholder for the learning rate value.
+        num_epochs (int): Number of training epochs.
+        batch_size (int): Batch size for the training.
+        logdir (path): Directory for the experiment logs.
+        ex_name (string): Unique name of this particular run.
+        val_epochs (bool): If "True" clustering results are saved every 10 epochs on default output files.
+        modelpath (path): Path for the model checkpoints.
+        learning_rate (float): Learning rate for the optimization.
+        epochs_pretrain (int): Number of VAE pretraining epochs.
+        latent_dim (int): Dimensionality of the VarPSOM's latent space.
+        num_clusters (int): Number of clusters.
+    """
+
+    epochs = 0
+    iterations = 0
+    train_gen = generator("train", batch_size)
+    val_gen = generator("val", batch_size)
+    len_data_train = len(data_train)
+    len_data_val = len(data_val)
+    num_batches = len_data_train // batch_size
+
+    saver = tf.train.Saver(max_to_keep=1)
+    summaries = tf.summary.merge_all()
+
+    with tf.Session() as sess:
+        sess.run(tf.global_variables_initializer())
+        test_losses = []
+        test_losses_mean = []
+        with LogFileWriter(ex):
+            train_writer = tf.summary.FileWriter(logdir + "/train", sess.graph)
+            test_writer = tf.summary.FileWriter(logdir + "/test", sess.graph)
+        train_step_SOMVAE, train_step_ae = model.optimize
+        x = model.inputs
+        p = model.p
+        is_training = model.is_training
+        graph = tf.get_default_graph()
+        z = graph.get_tensor_by_name("reconstruction_e/decoder/z_e:0")
+
+        print("\n**********Starting job {}********* \n".format(ex_name))
+        pbar = tqdm(total=(num_epochs + epochs_pretrain) * (num_batches))
+
+        print("\n\nAutoencoder Pretraining...\n")
+        a = np.zeros((batch_size, num_clusters))
+        dp = {p: a, is_training: True, z: np.zeros((batch_size, latent_dim))}
+        for epoch in range(epochs_pretrain):
+            for i in range(num_batches):
+                batch_data, _, _ = next(train_gen)
+                f_dic = {x: batch_data, lr_val: learning_rate}
+                f_dic.update(dp)
+                train_step_ae.run(feed_dict=f_dic)
+                if i % 100 == 0:
+                    batch_val, _, _ = next(val_gen)
+                    f_dic = {x: batch_val}
+                    f_dic.update(dp)
+                    test_loss, summary = sess.run([model.loss_reconstruction_ze, summaries], feed_dict=f_dic)
+                    test_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
+                    f_dic = {x: batch_data}
+                    f_dic.update(dp)
+                    train_loss, summary = sess.run([model.loss_reconstruction_ze, summaries], feed_dict=f_dic)
+                    train_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
+                pbar.set_postfix(epoch=epoch, train_loss=train_loss, test_loss=test_loss, refresh=False)
+                pbar.update(1)
+
+        print("\nClusters initialization...\n")
+        z_e = []
+        for t in range(9):
+            z_e.extend(sess.run(model.sample_z_e, feed_dict={
+                x: data_train[int(len(data_train) / 10) * t: int(len(data_train) / 10) * (t + 1)], is_training: True,
+                z: np.zeros((int(len(data_train) / 10), latent_dim))}))
+        z_e.extend(sess.run(model.sample_z_e, feed_dict={x: data_train[int(len(data_train) / 10) * 9:], is_training: True,
+                    z: np.zeros((int(len(data_val) / 10), latent_dim))}))
+        z_e = np.array(z_e)
+        assign_mu_op = model.get_assign_cluster_centers_op(features=z_e)
+        _ = sess.run(assign_mu_op)
+
+        print("\nTraining...\n")
+        for epoch in range(num_epochs):
+            epochs += 1
+            #Compute initial soft probabilities between data points and centroids
+            q = []
+            for t in range(9):
+                q.extend(sess.run(model.q, feed_dict={
+                        x: data_train[int(len(data_train) / 10) * t: int(len(data_train) / 10) * (t + 1)],
+                        is_training: True, z: np.zeros((int(len(data_train) / 10), latent_dim))}))
+            q.extend(sess.run(model.q, feed_dict={x: data_train[int(len(data_train) / 10) * 9:], is_training: True,
+                                                      z: np.zeros((int(len(data_train) / 10), latent_dim))}))
+            q = np.array(q)
+            ppt = model.target_distribution(q)
+            q = sess.run(model.q, feed_dict={x: data_val, is_training: True, z: np.zeros((len(data_val), latent_dim))})
+            ppv = model.target_distribution(q)
+
+            #Train
+            for i in range(num_batches):
+                iterations += 1
+                batch_data, _, ii = next(train_gen)
+                ftrain = {p: ppt[ii * batch_size: (ii + 1) * batch_size], is_training: True,
+                          z: np.zeros((batch_size, latent_dim))}
+                f_dic = {x: batch_data, lr_val: learning_rate}
+                f_dic.update(ftrain)
+                train_step_SOMVAE.run(feed_dict=f_dic)
+                batch_val, _, ii = next(val_gen)
+                fval = {p: ppv[ii * batch_size: (ii + 1) * batch_size], is_training: True,
+                        z: np.zeros((batch_size, latent_dim))}
+                f_dic = {x: batch_val}
+                f_dic.update(fval)
+                test_loss, summary = sess.run([model.loss, summaries], feed_dict=f_dic)
+                test_losses.append(test_loss)
+                if i % 100 == 0:
+                    test_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
+                    f_dic = {x: batch_data}
+                    f_dic.update(ftrain)
+                    train_loss, summary = sess.run([model.loss, summaries], feed_dict=f_dic)
+                    train_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
+                if i % 1000 == 0:
+                    test_loss_mean = np.mean(test_losses)
+                    test_losses_mean.append(test_loss_mean)
+                    test_losses = []
+
+                if len(test_losses_mean) > 0:
+                    test_s = test_losses_mean[-1]
+                else:
+                    test_s = test_losses_mean
+
+                pbar.set_postfix(epoch=epoch, train_loss=train_loss, test_loss=test_s, refresh=False)
+                pbar.update(1)
+            saver.save(sess, modelpath)
+
+            if val_epochs == True and epochs % 10 == 0:
+                saver.save(sess, modelpath)
+                results = evaluate_model(model, generator, len_data_val, x, modelpath, epochs)
+                if results is None:
+                    return None
+
+        saver.save(sess, modelpath)
+        results = evaluate_model(model, generator, len_data_val, x, modelpath, epochs)
+    return results
+
+
+@ex.capture
+def evaluate_model(model, generator, len_data_val, x, modelpath, epochs, batch_size, latent_dim, num_clusters,
+                   learning_rate, alpha, gamma, theta, epochs_pretrain, decay_factor, ex_name, data_set,
+                   validation, dropout, prior_var, prior):
+
+    """Evaluates the performance of the trained model in terms of normalized
+    mutual information adjusted mutual information score and purity.
+
+    Args:
+        model (VarPSOM): Trained VarPSOM model to evaluate.
+        generator (generator): Data generator for the batches.
+        len_data_val (int): Length of validation set.
+        x (tf.Tensor): Input tensor or placeholder.
+        modelpath (path): Path from which to restore the model.
+        epochs (int): number of epochs of training.
+        batch_size (int): Batch size for the training.
+        latent_dim (int): Dimensionality of the VarIDEC's latent space.
+        num_clusters (int): Number of clusters.
+        learning_rate (float): Learning rate for the optimization.
+        alpha (float): Student's t-distribution parameter.
+        gamma (float): Weight for the KL term of the VarIDEC clustering loss.
+        theta (float): Weight for the VAE loss.
+        epochs_pretrain (int): Number of VAE pretraining epochs.
+        decay_factor (float): Factor for the learning rate decay.
+        ex_name (string): Unique name of this particular run.
+        data_set (string): Data set for the training.
+        validation (bool): If "True" validation set is used for evaluation, otherwise test set is used.
+        dropout (float): Dropout factor for the feed-forward layers of the VAE.
+        prior_var (float): Multiplier of the diagonal variance of the VAE multivariate gaussian prior.
+        prior (float): Weight of the regularization term of the ELBO.
+
+    Returns:
+        dict: Dictionary of evaluation results (NMI, AMI, Purity).
+    """
+
+    saver = tf.train.Saver()
+    num_batches = len_data_val // batch_size
+
+    with tf.Session() as sess:
+        sess.run(tf.global_variables_initializer())
+        saver.restore(sess, modelpath)
+        graph = tf.get_default_graph()
+        z = graph.get_tensor_by_name("reconstruction_e/decoder/z_e:0")
+        is_training = model.is_training
+
+        if validation:
+            val_gen = generator("val", batch_size)
+        else:
+            val_gen = generator("test", batch_size)
+
+        test_k_all = []
+        labels_val_all = []
+        print("Evaluation...")
+        for i in range(num_batches):
+            batch_data, batch_labels, ii = next(val_gen)
+            labels_val_all.extend(batch_labels)
+            test_k = sess.run(model.k,
+                                  feed_dict={x: batch_data, is_training: True, z: np.zeros((batch_size, latent_dim))})
+            test_k_all.extend(test_k)
+
+        test_nmi = metrics.normalized_mutual_info_score(np.array(labels_val_all), test_k_all)
+        test_purity = cluster_purity(np.array(test_k_all), np.array(labels_val_all))
+        test_ami = metrics.adjusted_mutual_info_score(test_k_all, labels_val_all)
+
+    results = {}
+    results["NMI"] = test_nmi
+    results["Purity"] = test_purity
+    results["AMI"] = test_ami
+
+    if np.abs(test_ami-0.) < 0.0001 and np.abs(test_nmi-0.125) < 0.0001:
+        return None
+
+    if data_set == "fMNIST":
+        f = open("results_fMNIST_VarIDEC.txt", "a+")
+    else:
+        f = open("results_MNIST_VarIDEC.txt", "a+")
+
+    f.write(
+            "Epochs= %d, num_clusters=%d, latent_dim= %d, batch_size= %d, learning_rate= %f, gamma=%d, "
+            "theta=%f, alpha=%f, dropout=%f, decay_factor=%f, prior_var=%f, prior=%f, epochs_pretrain=%d"
+            % (epochs, num_clusters, latent_dim, batch_size, learning_rate, gamma, theta, alpha, dropout, decay_factor,
+               prior_var, prior, epochs_pretrain))
+
+    f.write(", RESULTS NMI: %f, AMI: %f, Purity: %f.  Name: %r \n"
+            % (results["NMI"], results["AMI"], results["Purity"], ex_name))
+    f.close()
+
+    return results
+
+
+@ex.automain
+def main(latent_dim, num_clusters, learning_rate, decay_factor, alpha, gamma, theta, ex_name, more_runs, data_set,
+         dropout, prior_var, prior, validation, decay_steps):
+    """Main method to build a model, train it and evaluate it.
+    Returns:
+        dict: Results of the evaluation (NMI, Purity).
+    """
+    # Dimensions for MNIST-like data
+    input_length = 28
+    input_channels = 28
+
+    lr_val = tf.placeholder_with_default(learning_rate, [])
+
+    model = VarIDEC(latent_dim=latent_dim, num_clusters=num_clusters, learning_rate=lr_val, decay_factor=decay_factor,
+                   dropout=dropout, prior_var=prior_var, prior=prior, input_length=input_length,
+                   input_channels=input_channels, alpha=alpha, theta=theta, gamma=gamma, decay_steps=decay_steps)
+
+    if data_set == "MNIST":
+        mnist = tf.keras.datasets.mnist.load_data(path='mnist.npz')
+        data_total = np.reshape(mnist[0][0], [-1, 28 * 28])
+        maxx = np.reshape(np.amax(data_total, axis=-1), [-1, 1])
+        data_total = np.reshape(data_total / maxx, [-1, 28, 28, 1])
+        labels_total = mnist[0][1]
+        data_test = np.reshape(mnist[1][0], [-1, 28 * 28])
+        maxx = np.reshape(np.amax(data_test, axis=-1), [-1, 1])
+        data_test = np.reshape(data_test / maxx, [-1, 28, 28, 1])
+        labels_test = mnist[1][1]
+        data_train, data_val, labels_train, labels_val = train_test_split(data_total, labels_total, test_size=0.15,
+                                                                          random_state=42)
+
+    else:
+        ((data_total, labels_total), (data_test, labels_test)) = tf.keras.datasets.fashion_mnist.load_data()
+        data_total = np.reshape(data_total, [-1, 28 * 28])
+        maxx = np.reshape(np.amax(data_total, axis=-1), [-1, 1])
+        data_total = np.reshape(data_total / maxx, [-1, 28, 28, 1])
+        data_test = np.reshape(data_test, [-1, 28 * 28])
+        maxx = np.reshape(np.amax(data_test, axis=-1), [-1, 1])
+        data_test = np.reshape(data_test / maxx, [-1, 28, 28, 1])
+        data_train, data_val, labels_train, labels_val = train_test_split(data_total, labels_total, test_size=0.15,
+                                                                          random_state=42)
+    data_generator = get_data_generator(data_train, data_val, labels_train, labels_val, data_test, labels_test)
+    if not validation:
+        data_val = data_test
+
+    if more_runs:
+        NMI = []
+        PUR = []
+        for i in range(10):
+            results = train_model(model, data_train, data_val, data_generator, lr_val)
+            NMI.append(results["NMI"])
+            PUR.append(results["Purity"])
+        NMI_mean = np.mean(NMI)
+        NMI_sd = np.std(NMI)
+        PUR_mean = np.mean(PUR)
+        PUR_sd = np.std(PUR)
+
+        print("\nRESULTS NMI: %f +- %f, PUR: %f +- %f.  Name: %r. \n" % (NMI_mean, NMI_sd, PUR_mean, PUR_sd, ex_name))
+
+    else:
+        results = train_model(model, data_train, data_val, data_generator, lr_val)
+
+        print("\n NMI: {}, AMI: {}, PUR: {}.  Name: %r.\n".format(results["NMI"], results["AMI"], results["Purity"],
+                                                                  ex_name))
+    return results
