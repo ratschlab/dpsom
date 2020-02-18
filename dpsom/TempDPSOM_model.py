@@ -1,10 +1,16 @@
 """
-Script for the VarTPSOM model
+Model architecture of TempDPSOM model
 """
 
 import functools
 import numpy as np
-import tensorflow as tf
+
+try:
+    import tensorflow.compat.v1 as tf 
+    tf.disable_v2_behavior()
+except:
+    import tensorflow as tf
+
 import tensorflow_probability as tfp
 from tensorflow.keras.layers import Input,Dense,Flatten,Dropout,Reshape,Conv2D,MaxPooling2D,UpSampling2D,Conv2DTranspose
 from tensorflow.keras.layers import BatchNormalization
@@ -36,14 +42,14 @@ def lazy_scope(function):
     return decorator
 
 
-class VarTPSOM:
-    """Class for the VarTPSOM model"""
+class TDPSOM:
+    """Class for the T-DPSOM model"""
 
     def __init__(self, input_size, latent_dim=10, som_dim=[8, 8], learning_rate=1e-4, decay_factor=0.99,
                  decay_steps=2000, input_channels=98, alpha=10., beta=100., gamma=100., kappa=0.,
                  theta=1., eta=1., dropout=0.5, prior=0.001):
 
-        """Initialization method for the VarTPSOM model object.
+        """Initialization method for the T-DPSOM model object.
         Args:
             input_size (int): Length of the input vector.
             latent_dim (int): The dimensionality of the latent embeddings (default: 100).
@@ -208,20 +214,22 @@ class VarTPSOM:
         with tf.variable_scope("next_state"):
             z_e_p = tf.placeholder(tf.float32, shape=[None, self.latent_dim], name="input_lstm")
             z_e = tf.cond(self.is_training, lambda: self.z_e, lambda: z_e_p)
-            rnn_input = tf.stop_gradient(tf.reshape(z_e, [self.batch_size, self.step_size, self.latent_dim]))
-            init_state_p = tf.placeholder(tf.float32, shape=[2, None, 10], name="init_state")
 
-            cell = tf.keras.layers.CuDNNLSTM(10, return_sequences=True, return_state=True)
+            rnn_input = tf.stop_gradient(tf.reshape(z_e, [self.batch_size, self.step_size, self.latent_dim]))
+            init_state_p = tf.placeholder(tf.float32, shape=[2, None, 100], name="init_state")
+
+            cell = tf.keras.layers.CuDNNLSTM(100, return_sequences=True, return_state=True)
             init_state = cell.get_initial_state(rnn_input)
             state = tf.cond(self.is_training, lambda: init_state, lambda: [init_state_p[0], init_state_p[1]])
             lstm_output, state_h, state_c = cell(rnn_input, initial_state=state)
             state = tf.identity([state_h, state_c], name="next_state")
-            lstm_output = tf.reshape(lstm_output, [self.batch_size*self.step_size, 10])
+            lstm_output = tf.reshape(lstm_output, [self.batch_size*self.step_size, 100])
 
             h_1 = tf.keras.layers.Dense(100, activation=tf.nn.leaky_relu)(lstm_output)
             next_z_e = tf.keras.layers.Dense(tfp.layers.IndependentNormal.params_size(self.latent_dim),
                                             activation=None)(h_1)
             next_z_e = tfp.layers.IndependentNormal(self.latent_dim)(next_z_e)
+            #next_z_e = tf.keras.layers.Dense(self.latent_dim, activation=None)(h_1)
 
         next_z_e_sample = tf.reshape(tf.identity(next_z_e), [-1, self.step_size, self.latent_dim], name="next_z_e")
         return next_z_e
@@ -247,19 +255,17 @@ class VarTPSOM:
         k2_not_right = tf.less(k_2, tf.constant(self.som_dim[1] - 1, dtype=tf.int64))
         k2_not_left = tf.greater(k_2, tf.constant(0, dtype=tf.int64))
 
-        k1_up = tf.where(k1_not_top, tf.add(k_1, 1), k_1)
-        k1_down = tf.where(k1_not_bottom, tf.subtract(k_1, 1), k_1)
-        k2_right = tf.where(k2_not_right, tf.add(k_2, 1), k_2)
-        k2_left = tf.where(k2_not_left, tf.subtract(k_2, 1), k_2)
+        k1_up = tf.where(k1_not_top, tf.add(k_1, 1), tf.zeros(tf.shape(k_1), dtype=tf.dtypes.int64))
+        k1_down = tf.where(k1_not_bottom, tf.subtract(k_1, 1),
+                           tf.ones(tf.shape(k_1), dtype=tf.dtypes.int64) * (self.som_dim[0] - 1))
+        k2_right = tf.where(k2_not_right, tf.add(k_2, 1), tf.zeros(tf.shape(k_2), dtype=tf.dtypes.int64))
+        k2_left = tf.where(k2_not_left, tf.subtract(k_2, 1),
+                           tf.ones(tf.shape(k_2), dtype=tf.dtypes.int64) * (self.som_dim[0] - 1))
 
-        z_q_up = tf.where(k1_not_top, tf.gather_nd(self.embeddings, tf.stack([k1_up, k_2], axis=1)),
-                          tf.zeros(tf.shape(self.z_e)))
-        z_q_down = tf.where(k1_not_bottom, tf.gather_nd(self.embeddings, tf.stack([k1_down, k_2], axis=1)),
-                            tf.zeros(tf.shape(self.z_e)))
-        z_q_right = tf.where(k2_not_right, tf.gather_nd(self.embeddings, tf.stack([k_1, k2_right], axis=1)),
-                             tf.zeros(tf.shape(self.z_e)))
-        z_q_left = tf.where(k2_not_left, tf.gather_nd(self.embeddings, tf.stack([k_1, k2_left], axis=1)),
-                            tf.zeros(tf.shape(self.z_e)))
+        z_q_up = tf.gather_nd(self.embeddings, tf.stack([k1_up, k_2], axis=1))
+        z_q_down = tf.gather_nd(self.embeddings, tf.stack([k1_down, k_2], axis=1))
+        z_q_right = tf.gather_nd(self.embeddings, tf.stack([k_1, k2_right], axis=1))
+        z_q_left = tf.gather_nd(self.embeddings, tf.stack([k_1, k2_left], axis=1))
 
         z_q_neighbors = tf.stack([self.z_q, z_q_up, z_q_down, z_q_right, z_q_left], axis=1)
         return z_q_neighbors
@@ -268,7 +274,10 @@ class VarTPSOM:
     def reconstruction_e(self):
         """Reconstructs the input from the encodings by learning a Gaussian distribution."""
         with tf.variable_scope("decoder", reuse=tf.AUTO_REUSE):
-            h_1 = tf.keras.layers.Dense(2000, activation=tf.nn.leaky_relu)(self.z_e)
+            z_p = tf.placeholder(tf.float32, shape=[None, self.latent_dim], name="z_e")
+            z_e = tf.cond(self.is_training, lambda: self.z_e, lambda: z_p)
+
+            h_1 = tf.keras.layers.Dense(2000, activation=tf.nn.leaky_relu)(z_e)
             h_1 = tf.keras.layers.BatchNormalization()(h_1)
             h_2 = tf.keras.layers.Dense(500, activation=tf.nn.leaky_relu)(h_1)
             h_2 = tf.keras.layers.BatchNormalization()(h_2)
@@ -320,7 +329,6 @@ class VarTPSOM:
     def loss_commit(self):
         """Computes the KL term of the clustering loss."""
         loss_commit = tf.reduce_mean(tf.reduce_sum(self.p * tf.log((self.p) / (self.q)), axis=1))
-        tf.summary.scalar("loss_commit", loss_commit)
         return loss_commit
 
     def target_distribution(self, q):
@@ -341,10 +349,10 @@ class VarTPSOM:
         k2_not_right = tf.less(k_2, tf.constant(self.som_dim[1] - 1, dtype=tf.int32))
         k2_not_left = tf.greater(k_2, tf.constant(0, dtype=tf.int32))
 
-        k1_up = tf.where(k1_not_top, tf.add(k_1, 1), tf.subtract(k_1, 1))
-        k1_down = tf.where(k1_not_bottom, tf.subtract(k_1, 1), tf.add(k_1, 1))
-        k2_right = tf.where(k2_not_right, tf.add(k_2, 1), tf.subtract(k_2, 1))
-        k2_left = tf.where(k2_not_left, tf.subtract(k_2, 1), tf.add(k_2, 1))
+        k1_up = tf.where(k1_not_top, tf.add(k_1, 1), tf.zeros(tf.shape(k_1), dtype=tf.dtypes.int32))
+        k1_down = tf.where(k1_not_bottom, tf.subtract(k_1, 1), tf.ones(tf.shape(k_1), dtype=tf.dtypes.int32) * (self.som_dim[0] - 1))
+        k2_right = tf.where(k2_not_right, tf.add(k_2, 1), tf.zeros(tf.shape(k_2), dtype=tf.dtypes.int32))
+        k2_left = tf.where(k2_not_left, tf.subtract(k_2, 1), tf.ones(tf.shape(k_2), dtype=tf.dtypes.int32) * (self.som_dim[0] - 1))
 
         k_up = k1_up * self.som_dim[0] + k_2
         k_down = k1_down * self.som_dim[0] + k_2
@@ -356,14 +364,17 @@ class VarTPSOM:
         q_down = tf.transpose(tf.gather_nd(q_t, tf.reshape(k_down, [self.som_dim[0] * self.som_dim[1], 1])))
         q_right = tf.transpose(tf.gather_nd(q_t, tf.reshape(k_right, [self.som_dim[0] * self.som_dim[1], 1])))
         q_left = tf.transpose(tf.gather_nd(q_t, tf.reshape(k_left, [self.som_dim[0] * self.som_dim[1], 1])))
-        q_neighbours = tf.stack([q_up, q_down, q_right, q_left], axis=2)
-        q_neighbours = tf.reduce_sum(q_neighbours, axis=-1)
+
+        q_neighbours = tf.concat([tf.expand_dims(q_up, -1), tf.expand_dims(q_down, -1),
+                                  tf.expand_dims(q_right, -1), tf.expand_dims(q_left, -1)], axis=2)
+        q_neighbours = tf.reduce_sum(tf.math.log(q_neighbours), axis=-1)
+
         mask = tf.greater(self.q, 0.1 * tf.ones_like(self.q))
         new_q = tf.multiply(self.q, tf.cast(mask, tf.float32))
         q_n = tf.math.multiply(q_neighbours, tf.stop_gradient(new_q))
         q_n = tf.reduce_sum(q_n, axis=-1)
-        qq = - tf.reduce_mean(q_n)
-        tf.summary.scalar("loss_som", qq)
+        qq = tf.math.negative(tf.reduce_mean(q_n))
+
         return qq
 
     @lazy_scope
@@ -371,8 +382,11 @@ class VarTPSOM:
         """Compute the prediction loss"""
         z_e = tf.reshape(self.z_e, [self.batch_size, self.step_size, self.latent_dim])
         z_e_next = tf.concat([z_e[:, 1:], tf.reshape(z_e[:, -1], [-1, 1, self.latent_dim])], axis=1)
-        loss_prediction = - tf.reduce_mean(self.prediction.log_prob(tf.stop_gradient(tf.reshape(z_e_next, [-1, self.latent_dim]))))
-        tf.summary.scalar("loss_prediction", loss_prediction)
+        z_e_next = tf.stop_gradient(tf.reshape(z_e_next, [-1, self.latent_dim]))
+        loss_prediction = - tf.reduce_mean(self.prediction.log_prob(z_e_next))
+        #loss_prediction = tf.reduce_mean(
+        #    tf.squared_difference(tf.stop_gradient(tf.reshape(z_e_next, [-1, self.latent_dim])),
+        #                          self.prediction))
         return loss_prediction
 
     @lazy_scope
@@ -386,7 +400,6 @@ class VarTPSOM:
         diff = tf.reduce_sum(tf.squared_difference(self.z_e, tf.stop_gradient(e)), axis=-1)
         q = tf.keras.backend.epsilon() + (1.0 / (1.0 + diff/self.alpha) ** ((self.alpha + 1.0) / 2.0))
         loss_smoothness = - tf.reduce_mean(q)
-        tf.summary.scalar("loss_smoothness", loss_smoothness)
         return loss_smoothness
 
     @lazy_scope
@@ -394,6 +407,11 @@ class VarTPSOM:
         """Aggregates the loss terms into the total loss."""
         loss = self.theta * self.loss_reconstruction_ze + self.gamma * self.loss_commit + self.beta * self.loss_som + \
                 self.kappa * self.loss_smoothness + self.eta*self.loss_prediction
+        tf.summary.scalar("loss_rec", self.theta * self.loss_reconstruction_ze)
+        tf.summary.scalar("loss_commit",  self.gamma * self.loss_commit)
+        tf.summary.scalar("loss_som", self.beta * self.loss_som)
+        tf.summary.scalar("loss_smoothness", self.kappa * self.loss_smoothness)
+        tf.summary.scalar("loss_prediction", self.eta*self.loss_prediction)
         tf.summary.scalar("loss", loss)
         return loss
 

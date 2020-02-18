@@ -1,9 +1,15 @@
 """
-Script of the VarPSOM model.
+Model architecture of the DPSOM model.
 """
 
 import functools
-import tensorflow as tf
+
+try:
+    import tensorflow.compat.v1 as tf 
+    tf.disable_v2_behavior()
+except:
+    import tensorflow as tf
+
 import tensorflow_probability as tfp
 from tensorflow.keras.layers import Input,Dense,Flatten,Dropout,Reshape,Conv2D,MaxPooling2D,UpSampling2D,Conv2DTranspose
 from tensorflow.keras.layers import BatchNormalization
@@ -32,13 +38,13 @@ def lazy_scope(function):
         return getattr(self, attribute)
     return decorator
 
-class VarPSOM:
-    """Class for the VarPSOM model"""
+class DPSOM:
+    """Class for the DPSOM model"""
 
     def __init__(self, latent_dim=100, som_dim=[8,8], learning_rate=1e-4, decay_factor=0.99, decay_steps=1000,
                  input_length=28, input_channels=28, alpha=10., beta=20., gamma=20., theta=1., dropout=0.5, prior_var=1,
                  prior=0.5, convolution=False):
-        """Initialization method for the VarPSOM model object.
+        """Initialization method for the DPSOM model object.
         Args:
             latent_dim (int): The dimensionality of the latent embeddings (default: 100).
             som_dim (list): The dimensionality of the self-organizing map (default: [8,8]).
@@ -218,20 +224,19 @@ class VarPSOM:
         k2_not_right = tf.less(k_2, tf.constant(self.som_dim[1]-1, dtype=tf.int64))
         k2_not_left = tf.greater(k_2, tf.constant(0, dtype=tf.int64))
 
-        k1_up = tf.where(k1_not_top, tf.add(k_1, 1), k_1)
-        k1_down = tf.where(k1_not_bottom, tf.subtract(k_1, 1), k_1)
-        k2_right = tf.where(k2_not_right, tf.add(k_2, 1), k_2)
-        k2_left = tf.where(k2_not_left, tf.subtract(k_2, 1), k_2)
+        k1_up = tf.where(k1_not_top, tf.add(k_1, 1), tf.zeros(tf.shape(k_1), dtype=tf.dtypes.int64))
+        k1_down = tf.where(k1_not_bottom, tf.subtract(k_1, 1),
+                           tf.ones(tf.shape(k_1), dtype=tf.dtypes.int64) * (self.som_dim[0] - 1))
+        k2_right = tf.where(k2_not_right, tf.add(k_2, 1), tf.zeros(tf.shape(k_2), dtype=tf.dtypes.int64))
+        k2_left = tf.where(k2_not_left, tf.subtract(k_2, 1),
+                           tf.ones(tf.shape(k_2), dtype=tf.dtypes.int64) * (self.som_dim[0] - 1))
 
-        z_q_up = tf.where(k1_not_top, tf.gather_nd(self.embeddings, tf.stack([k1_up, k_2], axis=1)),
-                          tf.zeros(tf.shape(self.sample_z_e)))
-        z_q_down = tf.where(k1_not_bottom, tf.gather_nd(self.embeddings, tf.stack([k1_down, k_2], axis=1)),
-                            tf.zeros(tf.shape(self.sample_z_e)))
-        z_q_right = tf.where(k2_not_right, tf.gather_nd(self.embeddings, tf.stack([k_1, k2_right], axis=1)),
-                             tf.zeros(tf.shape(self.sample_z_e)))
-        z_q_left = tf.where(k2_not_left, tf.gather_nd(self.embeddings, tf.stack([k_1, k2_left], axis=1)),
-                            tf.zeros(tf.shape(self.sample_z_e)))
+        z_q_up = tf.gather_nd(self.embeddings, tf.stack([k1_up, k_2], axis=1))
+        z_q_down = tf.gather_nd(self.embeddings, tf.stack([k1_down, k_2], axis=1))
+        z_q_right = tf.gather_nd(self.embeddings, tf.stack([k_1, k2_right], axis=1))
+        z_q_left = tf.gather_nd(self.embeddings, tf.stack([k_1, k2_left], axis=1))
         z_q_neighbors = tf.stack([self.z_q, z_q_up, z_q_down, z_q_right, z_q_left], axis=1)
+
         return z_q_neighbors
 
     @lazy_scope
@@ -284,7 +289,7 @@ class VarPSOM:
     def q(self):
         """Computes the soft assignments between the embeddings and the centroids."""
         with tf.name_scope('distribution'):
-            q = tf.keras.backend.epsilon() + 1.0 / (1.0 + self.z_dist_flat/self.alpha)**((self.alpha+1.0)/2.0)
+            q = tf.keras.backend.epsilon() + 1.0 / (1.0 + self.z_dist_flat / self.alpha) ** ((self.alpha + 1.0) / 2.0)
             q = (q / tf.reduce_sum(q, axis=1, keepdims=True))
             q = tf.identity(q, name="q")
         return q
@@ -294,7 +299,8 @@ class VarPSOM:
         """Computes the soft assignments between the embeddings and the centroids stopping the gradient of the latent
         embeddings."""
         with tf.name_scope('distribution'):
-            q = tf.keras.backend.epsilon() + 1.0 / (1.0 + self.z_dist_flat_ng / self.alpha) ** ((self.alpha + 1.0) / 2.0)
+            q = tf.keras.backend.epsilon() + 1.0 / (1.0 + self.z_dist_flat_ng / self.alpha) ** (
+                        (self.alpha + 1.0) / 2.0)
             q = (q / tf.reduce_sum(q, axis=1, keepdims=True))
         return q
 
@@ -307,12 +313,12 @@ class VarPSOM:
     @lazy_scope
     def loss_commit(self):
         """Computes the KL term of the clustering loss."""
-        loss_commit = tf.reduce_mean(tf.reduce_sum(self.p * tf.log(self.p / (self.q)), axis=1))
+        loss_commit = tf.reduce_mean(tf.reduce_sum(self.p * tf.log(self.p / self.q), axis=1))
         return loss_commit
 
     def target_distribution(self, q):
         """Computes the target distribution given the soft assignment between embeddings and centroids."""
-        p = q ** 2 / q.sum(axis=0)
+        p = q ** 2 / (q.sum(axis=0))
         p = p / p.sum(axis=1, keepdims=True)
         return p
 
@@ -328,10 +334,12 @@ class VarPSOM:
         k2_not_right = tf.less(k_2, tf.constant(self.som_dim[1] - 1, dtype=tf.int32))
         k2_not_left = tf.greater(k_2, tf.constant(0, dtype=tf.int32))
 
-        k1_up = tf.where(k1_not_top, tf.add(k_1, 1), tf.subtract(k_1, 1))
-        k1_down = tf.where(k1_not_bottom, tf.subtract(k_1, 1), tf.add(k_1, 1))
-        k2_right = tf.where(k2_not_right, tf.add(k_2, 1), tf.subtract(k_2, 1))
-        k2_left = tf.where(k2_not_left, tf.subtract(k_2, 1), tf.add(k_2, 1))
+        k1_up = tf.where(k1_not_top, tf.add(k_1, 1), tf.zeros(tf.shape(k_1), dtype=tf.dtypes.int32))
+        k1_down = tf.where(k1_not_bottom, tf.subtract(k_1, 1),
+                           tf.ones(tf.shape(k_1), dtype=tf.dtypes.int32) * (self.som_dim[0] - 1))
+        k2_right = tf.where(k2_not_right, tf.add(k_2, 1), tf.zeros(tf.shape(k_2), dtype=tf.dtypes.int32))
+        k2_left = tf.where(k2_not_left, tf.subtract(k_2, 1),
+                           tf.ones(tf.shape(k_2), dtype=tf.dtypes.int32) * (self.som_dim[0] - 1))
 
         k_up = k1_up * self.som_dim[0] + k_2
         k_down = k1_down * self.som_dim[0] + k_2
@@ -344,8 +352,9 @@ class VarPSOM:
         q_right = tf.transpose(tf.gather_nd(q_t, tf.reshape(k_right, [self.som_dim[0] * self.som_dim[1], 1])))
         q_left = tf.transpose(tf.gather_nd(q_t, tf.reshape(k_left, [self.som_dim[0] * self.som_dim[1], 1])))
         q_neighbours = tf.stack([q_up, q_down, q_right, q_left], axis=2)
-        q_neighbours = tf.reduce_sum(q_neighbours, axis=-1)
-        mask = tf.greater(self.q, 0.1 * tf.ones_like(self.q))
+        q_neighbours = tf.reduce_sum(tf.math.log(q_neighbours), axis=-1)
+        maxx = 0.1
+        mask = tf.greater_equal(self.q, maxx * tf.ones_like(self.q))
         new_q = tf.multiply(self.q, tf.cast(mask, tf.float32))
         q_n = tf.math.multiply(q_neighbours, tf.stop_gradient(new_q))
         q_n = tf.reduce_sum(q_n, axis=-1)

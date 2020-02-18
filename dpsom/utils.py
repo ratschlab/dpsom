@@ -1,5 +1,5 @@
 """
-Utility functions for the VarPSOM model
+Utility functions for the DPSOM model
 """
 
 import numpy as np

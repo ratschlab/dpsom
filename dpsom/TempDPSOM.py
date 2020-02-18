@@ -1,18 +1,26 @@
 """
-Script for training the VarTPSOM model
+Script for training the TempDPSOM model
 """
 
 import uuid
+import sys
+import timeit
 from datetime import date
 import numpy as np
-import tensorflow as tf
+
+try:
+    import tensorflow.compat.v1 as tf 
+    tf.disable_v2_behavior()
+except:
+    import tensorflow as tf
+
 from tqdm import tqdm
 import sacred
 from sacred.stflow import LogFileWriter
 import math
 import h5py
 from sklearn import metrics
-from VarTPSOM_model import VarTPSOM
+from TempDPSOM_model import TDPSOM
 from sklearn.model_selection import train_test_split
 
 ex = sacred.Experiment("hyperopt")
@@ -26,11 +34,11 @@ def ex_config():
             input_size (int): Length of the input vector.
             num_epochs (int): Number of training epochs.
             batch_size (int): Batch size for the training.
-            latent_dim (int): Dimensionality of the VarTPSOM's latent space.
+            latent_dim (int): Dimensionality of the T-DPSOM's latent space.
             som_dim (list): Dimensionality of the self-organizing map.
             learning_rate (float): Learning rate for the optimization.
             alpha (float): Student's t-distribution parameter.
-            gamma (float): Weight for the KL term of the VarTPSOM clustering loss.
+            gamma (float): Weight for the KL term of the T-DPSOM clustering loss.
             beta (float): Weight for the SOM loss.
             kappa (float): Weight for the smoothness loss.
             theta (float): Weight for the VAE loss.
@@ -49,16 +57,16 @@ def ex_config():
                               variance.
         """
     input_size = 98
-    num_epochs = 50
+    num_epochs = 100
     batch_size = 300
-    latent_dim = 10
-    som_dim = [8, 8]
+    latent_dim = 20
+    som_dim = [16,16]
     learning_rate = 0.001
     alpha = 10.
-    beta = 50.
+    beta = 10.
     gamma = 100.
     kappa = 25.
-    theta = 0.001
+    theta = 0.01
     eta = 1.
     epochs_pretrain = 30
     decay_factor = 0.99
@@ -69,10 +77,14 @@ def ex_config():
     modelpath = "../models/{}/{}".format(ex_name, ex_name)
     validation = False
     dropout = 0.5
-    prior = 0.001
+    prior = 0.00001
     val_epochs = False
     more_runs = False
-
+    save_pretrain = False
+    use_saved_pretrain = False
+    
+    benchmark=False # Benchmark train time per epoch and return
+    train_ratio=1.0 # If changed, use a subset of the training data
 
 @ex.capture
 def get_data(validation):
@@ -86,7 +98,9 @@ def get_data(validation):
             np.array: Val/test data depending on validation value.
             np.array: Val/test labels."""
 
+    #TO DOWNLOAD THE DATA FIRST
     hf = h5py.File('../data/eICU_data.csv', 'r')
+    #############################################
     data_total = np.array(hf.get('x'))
     endpoints_total = np.array(hf.get('y'))
     hf.close()
@@ -136,18 +150,18 @@ def batch_generator(data_train, data_val, endpoints_total_val, batch_size, mode=
 
 @ex.capture
 def train_model(model, data_train, data_val, endpoints_total_val, lr_val, num_epochs, batch_size, latent_dim, som_dim,
-                learning_rate, epochs_pretrain, ex_name, logdir, modelpath, val_epochs):
+                learning_rate, epochs_pretrain, ex_name, logdir, modelpath, val_epochs, save_pretrain, use_saved_pretrain, benchmark, train_ratio):
 
-    """Trains the VarTPSOM model.
+    """Trains the T-DPSOM model.
         Params:
-            model (VarPSOM): VarPSOM model to train.
+            model (T-DPSOM): T-DPSOM model to train.
             data_train (np.array): Training set.
             data_val (np.array): Validation/test set.
             endpoints_total_val (np.array): Validation/test labels.
             lr_val (tf.Tensor): Placeholder for the learning rate value.
             num_epochs (int): Number of training epochs.
             batch_size (int): Batch size for the training.
-            latent_dim (int): Dimensionality of the VarTPSOM's latent space.
+            latent_dim (int): Dimensionality of the T-DPSOM's latent space.
             som_dim (list): Dimensionality of the self-organizing map.
             learning_rate (float): Learning rate for the optimization.
             epochs_pretrain (int): Number of VAE pretraining epochs.
@@ -160,13 +174,14 @@ def train_model(model, data_train, data_val, endpoints_total_val, lr_val, num_ep
     max_n_step = 72
     epochs = 0
     iterations = 0
+    pretrainpath = "../models/pretrain/LSTM"
     len_data_train = len(data_train)
     len_data_val = len(data_val)
     num_batches = len_data_train // batch_size
     train_gen = batch_generator(data_train, data_val, endpoints_total_val, mode="train")
     val_gen = batch_generator(data_train, data_val, endpoints_total_val, mode="val")
 
-    saver = tf.train.Saver(max_to_keep=2)
+    saver = tf.train.Saver(max_to_keep=50)
     summaries = tf.summary.merge_all()
     with tf.Session() as sess:
         sess.run(tf.global_variables_initializer())
@@ -182,8 +197,9 @@ def train_model(model, data_train, data_val, endpoints_total_val, lr_val, num_ep
         graph = tf.get_default_graph()
         init_1 = graph.get_tensor_by_name("prediction/next_state/init_state:0")
         z_e_p = graph.get_tensor_by_name("prediction/next_state/input_lstm:0")
+        z_e_rec = graph.get_tensor_by_name('reconstruction_e/decoder/z_e:0')
         training_dic = {is_training: True, z_e_p: np.zeros((max_n_step * batch_size, latent_dim)),
-                        init_1: np.zeros((2, batch_size, 10))}
+                        init_1: np.zeros((2, batch_size, 100)), z_e_rec: np.zeros((max_n_step * batch_size, latent_dim))}
 
         pbar = tqdm(total=(num_epochs+epochs_pretrain*3) * (num_batches))
 
@@ -192,85 +208,139 @@ def train_model(model, data_train, data_val, endpoints_total_val, lr_val, num_ep
         dp = {p: a}
         dp.update(training_dic)
 
-        print("\n\nAutoencoder Pretraining...\n")
-        for epoch in range(epochs_pretrain):
-            for i in range(num_batches):
-                batch_data, ii = next(train_gen)
-                f_dic = {x: batch_data, lr_val: learning_rate}
-                f_dic.update(dp)
-                train_step_ae.run(feed_dict=f_dic)
-                if i % 100 == 0:
-                    batch_val, _, ii = next(val_gen)
-                    f_dic = {x: batch_val}
-                    f_dic.update(dp)
-                    test_loss, summary = sess.run([model.loss_reconstruction_ze, summaries], feed_dict=f_dic)
-                    test_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
-                    f_dic = {x: batch_data}
-                    f_dic.update(dp)
-                    train_loss, summary = sess.run([model.loss_reconstruction_ze, summaries], feed_dict=f_dic)
-                    train_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
-                pbar.set_postfix(epoch=epoch, train_loss=train_loss, test_loss=test_loss, refresh=False)
-                pbar.update(1)
+        if benchmark:
+            ttime_per_epoch=[]
+            ttime_ae_per_epoch=[]
+            ttime_som_per_epoch=[]
+            ttime_pred_per_epoch=[]
 
-        print("\n\nSOM initialization...\n")
-        for epoch in range(epochs_pretrain//3):
-            for i in range(num_batches):
-                batch_data, ii = next(train_gen)
-                f_dic = {x: batch_data, lr_val: 0.1}
-                f_dic.update(dp)
-                train_step_som.run(feed_dict=f_dic)
-                if i % 100 == 0:
-                    batch_val, _, ii = next(val_gen)
-                    f_dic = {x: batch_val}
-                    f_dic.update(dp)
-                    test_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
-                    test_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
-                    f_dic = {x: batch_data}
-                    f_dic.update(dp)
-                    train_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
-                    train_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
-                pbar.set_postfix(epoch=epoch, train_loss=train_loss, test_loss=test_loss, refresh=False)
-                pbar.update(1)
-        for epoch in range(epochs_pretrain//3):
-            for i in range(num_batches):
-                batch_data, ii = next(train_gen)
-                f_dic = {x: batch_data, lr_val: 0.01}
-                f_dic.update(dp)
-                train_step_som.run(feed_dict=f_dic)
-                if i % 100 == 0:
-                    batch_val, _, ii = next(val_gen)
-                    f_dic = {x: batch_val}
-                    f_dic.update(dp)
-                    test_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
-                    test_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
-                    f_dic = {x: batch_data}
-                    f_dic.update(dp)
-                    train_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
-                    train_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
-                pbar.set_postfix(epoch=epoch, train_loss=train_loss, test_loss=test_loss, refresh=False)
-                pbar.update(1)
+        if use_saved_pretrain:
+            print("\n\nUsing Saved Pretraining...\n")
+            saver.restore(sess, pretrainpath)
+        else:
+            print("\n\nAutoencoder Pretraining...\n")
+            if benchmark:
+                t_begin_all=timeit.default_timer()
 
-        for epoch in range(epochs_pretrain//3):
-            for i in range(num_batches):
-                batch_data, ii = next(train_gen)
-                f_dic = {x: batch_data, lr_val: 0.01}
-                f_dic.update(dp)
-                train_step_som.run(feed_dict=f_dic)
-                if i % 100 == 0:
-                    batch_val, _, ii = next(val_gen)
-                    f_dic = {x: batch_val}
+            for epoch in range(epochs_pretrain):
+                if benchmark:
+                    t_begin=timeit.default_timer()
+                for i in range(num_batches):
+                    batch_data, ii = next(train_gen)
+                    f_dic = {x: batch_data, lr_val: learning_rate}
                     f_dic.update(dp)
-                    test_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
-                    test_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
-                    f_dic = {x: batch_data}
+                    train_step_ae.run(feed_dict=f_dic)
+                    if i % 100 == 0:
+                        batch_val, _, ii = next(val_gen)
+                        f_dic = {x: batch_val}
+                        f_dic.update(dp)
+                        test_loss, summary = sess.run([model.loss_reconstruction_ze, summaries], feed_dict=f_dic)
+                        test_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
+                        f_dic = {x: batch_data}
+                        f_dic.update(dp)
+                        train_loss, summary = sess.run([model.loss_reconstruction_ze, summaries], feed_dict=f_dic)
+                        train_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
+                    pbar.set_postfix(epoch=epoch, train_loss=train_loss, test_loss=test_loss, refresh=False)
+                    pbar.update(1)
+                if benchmark:
+                    t_end=timeit.default_timer()
+                    ttime_ae_per_epoch.append(t_end-t_begin)
+
+            if benchmark:
+                t_end_all=timeit.default_timer()
+                ttime_ae_pretrain=t_end_all-t_begin_all
+
+            print("\n\nSOM initialization...\n")
+            if benchmark:
+                t_begin_all=timeit.default_timer()
+
+            for epoch in range(epochs_pretrain//3):
+                if benchmark:
+                    t_begin=timeit.default_timer()
+                for i in range(num_batches):
+                    batch_data, ii = next(train_gen)
+                    f_dic = {x: batch_data, lr_val: 0.1}
                     f_dic.update(dp)
-                    train_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
-                    train_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
-                pbar.set_postfix(epoch=epoch, train_loss=train_loss, test_loss=test_loss, refresh=False)
-                pbar.update(1)
+                    train_step_som.run(feed_dict=f_dic)
+                    if i % 100 == 0:
+                        batch_val, _, ii = next(val_gen)
+                        f_dic = {x: batch_val}
+                        f_dic.update(dp)
+                        test_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
+                        test_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
+                        f_dic = {x: batch_data}
+                        f_dic.update(dp)
+                        train_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
+                        train_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
+                    pbar.set_postfix(epoch=epoch, train_loss=train_loss, test_loss=test_loss, refresh=False)
+                    pbar.update(1)
+                if benchmark:
+                    t_end=timeit.default_timer()
+                    ttime_som_per_epoch.append(t_end-t_begin)
+
+            for epoch in range(epochs_pretrain//3):
+                if benchmark:
+                    t_begin=timeit.default_timer()
+                for i in range(num_batches):
+                    batch_data, ii = next(train_gen)
+                    f_dic = {x: batch_data, lr_val: 0.01}
+                    f_dic.update(dp)
+                    train_step_som.run(feed_dict=f_dic)
+                    if i % 100 == 0:
+                        batch_val, _, ii = next(val_gen)
+                        f_dic = {x: batch_val}
+                        f_dic.update(dp)
+                        test_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
+                        test_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
+                        f_dic = {x: batch_data}
+                        f_dic.update(dp)
+                        train_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
+                        train_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
+                    pbar.set_postfix(epoch=epoch, train_loss=train_loss, test_loss=test_loss, refresh=False)
+                    pbar.update(1)
+                if benchmark:
+                    t_end=timeit.default_timer()
+                    ttime_som_per_epoch.append(t_end-t_begin)
+
+            for epoch in range(epochs_pretrain//3):
+                if benchmark:
+                    t_begin=timeit.default_timer()
+                for i in range(num_batches):
+                    batch_data, ii = next(train_gen)
+                    f_dic = {x: batch_data, lr_val: 0.01}
+                    f_dic.update(dp)
+                    train_step_som.run(feed_dict=f_dic)
+                    if i % 100 == 0:
+                        batch_val, _, ii = next(val_gen)
+                        f_dic = {x: batch_val}
+                        f_dic.update(dp)
+                        test_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
+                        test_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
+                        f_dic = {x: batch_data}
+                        f_dic.update(dp)
+                        train_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
+                        train_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
+                    pbar.set_postfix(epoch=epoch, train_loss=train_loss, test_loss=test_loss, refresh=False)
+                    pbar.update(1)
+                if benchmark:
+                    t_end=timeit.default_timer()
+                    ttime_som_per_epoch.append(t_end-t_begin)
+
+            if benchmark:
+                t_end_all=timeit.default_timer()
+                ttime_som=t_end_all-t_begin_all
+
+            if save_pretrain:
+                saver.save(sess, pretrainpath)
 
         print("\n\nTraining...\n")
+
+        if benchmark:
+            t_begin_all=timeit.default_timer()
+
         for epoch in range(num_epochs):
+            if benchmark:
+                t_begin=timeit.default_timer()
             epochs += 1
             print(epochs)
             f_dic = {x: data_train}
@@ -300,6 +370,8 @@ def train_model(model, data_train, data_val, endpoints_total_val, lr_val, num_ep
                 f_dic.update(ftrain)
                 f_dic.update(training_dic)
                 train_step_SOMVAE.run(feed_dict=f_dic)
+                train_step_prob.run(feed_dict=f_dic)
+
                 batch_val, _, ii = next(val_gen)
                 fval = {p: ppv[ii * batch_size*72: (ii + 1)*batch_size*72]}
                 f_dic = {x: batch_val}
@@ -329,13 +401,68 @@ def train_model(model, data_train, data_val, endpoints_total_val, lr_val, num_ep
                 pbar.set_postfix(epoch=epoch, train_loss=train_loss, test_loss=test_s, refresh=False)
                 pbar.update(1)
 
-            if val_epochs==True:
-                saver.save(sess, modelpath)
-                results = evaluate_model(model, x, val_gen, len_data_val, modelpath, epochs)
+            if val_epochs==True and epoch % 5 == 0:
+                path = "../models/exp/exp"+ str(epoch)+"/LSTM"
+                saver.save(sess, path)
+                #results = evaluate_model(model, x, val_gen, len_data_val, modelpath, epochs)
+
+            if benchmark:
+                t_end=timeit.default_timer()
+                ttime_per_epoch.append(t_end-t_begin)
+
+        if benchmark:
+            t_end_all=timeit.default_timer()
+            ttime_training=t_end_all-t_begin_all
+
+        print("\n\nPrediction Finetuning...\n")
+        if benchmark:
+            t_begin_all=timeit.default_timer()
+
+        for epoch in range(200):
+            if benchmark:
+                t_begin=timeit.default_timer()
+            for i in range(num_batches):
+                batch_data, ii = next(train_gen)
+                f_dic = {x: batch_data, lr_val: learning_rate*10}
+                f_dic.update(dp)
+                train_step_prob.run(feed_dict=f_dic)
+                if i % 100 == 0:
+                    batch_val, _, ii = next(val_gen)
+                    f_dic = {x: batch_val}
+                    f_dic.update(dp)
+                    test_loss, summary = sess.run([model.loss_prediction, summaries], feed_dict=f_dic)
+                    test_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
+                    f_dic = {x: batch_data}
+                    f_dic.update(dp)
+                    train_loss, summary = sess.run([model.loss_prediction, summaries], feed_dict=f_dic)
+                    train_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
+                pbar.set_postfix(epoch=epoch, train_loss=train_loss, test_loss=test_loss, refresh=False)
+                pbar.update(1)
+                
+            if benchmark:
+                t_end=timeit.default_timer()
+                ttime_pred_per_epoch.append(t_end-t_begin)
+
+        if benchmark:
+            t_end_all=timeit.default_timer()
+            ttime_pred=t_end_all-t_begin_all
 
         saver.save(sess, modelpath)
         results = evaluate_model(model, x, val_gen, len_data_val, modelpath, epochs)
         pbar.close()
+
+        if benchmark:
+            print("\nNumber of time series in train: {} %, {}".format(train_ratio, len(data_train)))
+            print("SOM init time: {:.3f}".format(ttime_som))
+            print("SOM init time per epoch: {:.3f}".format(np.mean(ttime_som_per_epoch)))
+            print("AE pretrain time: {:.3f}".format(ttime_ae_pretrain))
+            print("AE pretrain time per epoch: {:.3f}".format(np.mean(ttime_ae_per_epoch)))
+            print("Training time: {:.3f}".format(ttime_training))
+            print("Training time per epoch: {:.3f}".format(np.mean(ttime_per_epoch)))
+            print("Pred finetuning time: {:.3f}".format(ttime_pred))
+            print("Pred finetuning time per epoch: {:.3f}".format(np.mean(ttime_pred_per_epoch)))
+            sys.exit(0)
+
         return results
 
 
@@ -346,7 +473,7 @@ def evaluate_model(model, x, val_gen, len_data_val, modelpath, epochs, batch_siz
         mutual information adjusted mutual information score and purity.
 
         Args:
-            model (VarPSOM): Trained VarPSOM model to evaluate.
+            model (T-DPSOM): Trained T-DPSOM model to evaluate.
             x (tf.Tensor): Input tensor or placeholder.
             val_gen (generator): Val/Test generator for the batches.
             len_data_val (int): Length of validation set.
@@ -364,7 +491,7 @@ def evaluate_model(model, x, val_gen, len_data_val, modelpath, epochs, batch_siz
             kappa (float): Weight for the smoothness loss.
             dropout (float): Dropout factor for the feed-forward layers of the VAE.
             prior (float): Weight of the regularization term of the ELBO.
-            latent_dim (int): Dimensionality of the VarTPSOM's latent space.
+            latent_dim (int): Dimensionality of the T-DPSOM's latent space.
             eta (float): Weight for the prediction loss.
 
         Returns:
@@ -384,8 +511,9 @@ def evaluate_model(model, x, val_gen, len_data_val, modelpath, epochs, batch_siz
         graph = tf.get_default_graph()
         init_1 = graph.get_tensor_by_name("prediction/next_state/init_state:0")
         z_e_p = graph.get_tensor_by_name("prediction/next_state/input_lstm:0")
+        z_e_rec = graph.get_tensor_by_name('reconstruction_e/decoder/z_e:0')
         training_dic = {is_training: True, z_e_p: np.zeros((max_n_step * batch_size, latent_dim)),
-                        init_1: np.zeros((2, batch_size, 10))}
+                        init_1: np.zeros((2, batch_size, 100)), z_e_rec: np.zeros((max_n_step * batch_size, latent_dim))}
 
         test_k_all = []
         labels_val_all = []
@@ -404,12 +532,49 @@ def evaluate_model(model, x, val_gen, len_data_val, modelpath, epochs, batch_siz
 
         labels_val_all = np.array(labels_val_all)
         test_k_all = np.array(test_k_all)
-        labels_val_all = np.reshape(labels_val_all, (-1, 8))
+        labels_val_all = np.reshape(labels_val_all, (-1, labels_val_all.shape[-1]))
+        print("Mean: {:.3f}, Std: {:.3f}".format(np.mean(labels_val_all[:,3]), np.std(labels_val_all[:,3])))
         NMI_24 = metrics.normalized_mutual_info_score(labels_val_all[:, 3], test_k_all)
         NMI_12 = metrics.normalized_mutual_info_score(labels_val_all[:, 2], test_k_all)
         NMI_6 = metrics.normalized_mutual_info_score(labels_val_all[:, 1], test_k_all)
         NMI_1 = metrics.normalized_mutual_info_score(labels_val_all[:, 0], test_k_all)
         AMI_1 = metrics.adjusted_mutual_info_score(test_k_all, labels_val_all[:, 0])
+
+        mean = np.sum(labels_val_all[:, 0]) / len(labels_val_all[:, 0])
+        ones = np.ones((len(np.reshape(test_k_all, (-1)))))
+        clust_matr1 = np.zeros(som_dim[0] * som_dim[1])
+        labels = labels_val_all[:, 0]
+        for i in range(som_dim[0] * som_dim[1]):
+            dd = np.sum(ones[np.where(np.reshape(test_k_all, (-1)) == i)])
+            if dd == 0:
+                s1 = 0
+            else:
+                s1 = np.sum(labels[np.where(np.reshape(test_k_all, (-1)) == i)]) / np.sum(
+                    ones[np.where(np.reshape(test_k_all, (-1)) == i)])
+            clust_matr1[i] = s1
+
+        sd = som_dim[0]*som_dim[1]
+        k = np.arange(0, sd)
+        k1 = k // som_dim[0]
+        k2 = k % som_dim[1]
+        W = np.zeros((sd, sd))
+        for i in range(sd):
+            for j in range(sd):
+                d1 = np.abs((k1[i] - k1[j]))
+                d2 = np.abs((k2[i] - k2[j]))
+                d1 = min(som_dim[0] - d1, d1)
+                d2 = min(som_dim[1] - d2, d2)
+                W[i, j] = np.exp(-(d1 + d2))
+
+        M = 0
+        N_n = 0
+        for i in range(sd):
+            for j in range(sd):
+                M += (clust_matr1[i] - mean) * (clust_matr1[j] - mean) * W[i, j]
+        for i in range(sd):
+            N_n += (clust_matr1[i] - mean) ** 2
+        W_n = np.sum(W)
+        I = M * sd / (N_n * W_n)
 
     results = {}
     results["NMI_24"] = NMI_24
@@ -417,15 +582,16 @@ def evaluate_model(model, x, val_gen, len_data_val, modelpath, epochs, batch_siz
     results["NMI_6"] = NMI_6
     results["NMI_1"] = NMI_1
     results["AMI_1"] = AMI_1
+    results["MI"] = I
 
     f = open("results_eICU.txt", "a+")
     f.write("Epochs= %d, som_dim=[%d,%d], latent_dim= %d, batch_size= %d, learning_rate= %f, "
             "theta= %f, eta= %f, beta= %f, alpha=%f, gamma=%f, epochs_pretrain=%d, dropout= %f, prior= %f"
                 % (epochs, som_dim[0], som_dim[1], latent_dim, batch_size, learning_rate, theta, eta, beta,
                    alpha, gamma, epochs_pretrain, dropout, prior))
-    f.write(", kappa= %f, NMI24: %f, NMI12: %f, NMI6: %f, NMI1: %f, AMI1: %f.Name: %r \n"
+    f.write(", kappa= %f, NMI24: %f, NMI12: %f, NMI6: %f, NMI1: %f, AMI1: %f, I: %f.Name: %r \n"
             % (kappa, results["NMI_24"], results["NMI_12"], results["NMI_6"], results["NMI_1"], results["AMI_1"],
-               ex_name))
+               results["MI"], ex_name))
     f.close()
 
     return results
@@ -433,17 +599,20 @@ def evaluate_model(model, x, val_gen, len_data_val, modelpath, epochs, batch_siz
 
 @ex.automain
 def main(input_size, latent_dim, som_dim, learning_rate, decay_factor, alpha, beta, gamma, theta, ex_name, kappa, prior,
-         more_runs, dropout, eta, epochs_pretrain, batch_size, num_epochs):
+         more_runs, dropout, eta, epochs_pretrain, batch_size, num_epochs, train_ratio):
 
     input_channels = 98
 
     lr_val = tf.placeholder_with_default(learning_rate, [])
 
-    model = VarTPSOM(input_size=input_size, latent_dim=latent_dim, som_dim=som_dim, learning_rate=lr_val,
-                     decay_factor=decay_factor, dropout=dropout, input_channels=input_channels, alpha=alpha, beta=beta,
-                     eta=eta, kappa=kappa, theta=theta, gamma=gamma, prior=prior)
+    model = TDPSOM(input_size=input_size, latent_dim=latent_dim, som_dim=som_dim, learning_rate=lr_val,
+                   decay_factor=decay_factor, dropout=dropout, input_channels=input_channels, alpha=alpha, beta=beta,
+                   eta=eta, kappa=kappa, theta=theta, gamma=gamma, prior=prior)
 
     data_train, data_val, _, endpoints_total_val = get_data()
+
+    if train_ratio<1.0:
+        data_train=data_train[:int(len(data_train)*train_ratio)]
 
     if not more_runs:
         results = train_model(model, data_train, data_val, endpoints_total_val, lr_val)
@@ -453,6 +622,7 @@ def main(input_size, latent_dim, som_dim, learning_rate, decay_factor, alpha, be
         NMI_12_all=[]
         NMI_6_all = []
         NMI_1_all = []
+        MI_all = []
         T = 10
         for i in range(T):
             results = train_model(model, data_train, data_val, endpoints_total_val, lr_val)
@@ -472,15 +642,18 @@ def main(input_size, latent_dim, som_dim, learning_rate, decay_factor, alpha, be
                 NMI_12_all.append(results["NMI_12"])
                 NMI_6_all.append(results["NMI_6"])
                 NMI_1_all.append(results["NMI_1"])
+                MI_all.append(results["MI"])
 
         NMI_24_mean = np.mean(NMI_24_all)
-        NMI_24_sd = np.std(NMI_24_all)
+        NMI_24_sd = np.std(NMI_24_all)  / np.sqrt(10)
         NMI_12_mean = np.mean(NMI_12_all)
-        NMI_12_sd = np.std(NMI_12_all)
+        NMI_12_sd = np.std(NMI_12_all) / np.sqrt(10)
         NMI_6_mean = np.mean(NMI_6_all)
-        NMI_6_sd = np.std(NMI_6_all)
+        NMI_6_sd = np.std(NMI_6_all) / np.sqrt(10)
         NMI_1_mean = np.mean(NMI_1_all)
-        NMI_1_sd = np.std(NMI_1_all)
+        NMI_1_sd = np.std(NMI_1_all) / np.sqrt(10)
+        MI_mean = np.mean(MI_all)
+        MI_sd = np.std(MI_all) / np.sqrt(10)
 
         f = open("evaluation_eICU.txt", "a+")
         f.write(
@@ -490,9 +663,9 @@ def main(input_size, latent_dim, som_dim, learning_rate, decay_factor, alpha, be
                    kappa, gamma, beta, eta, epochs_pretrain, num_epochs))
 
 
-        f.write(", T= %d, RESULTS NMI24: %f + %f, NMI12: %f + %f, NMI6: %f + %f, NMI1: %f + %f.  Name: %r \n"
+        f.write(", T= %d, RESULTS NMI24: %f + %f, NMI12: %f + %f, NMI6: %f + %f, NMI1: %f + %f, MI: %f + %f.  Name: %r \n"
                 % (T, NMI_24_mean, NMI_24_sd, NMI_12_mean, NMI_12_sd, NMI_6_mean, NMI_6_sd, NMI_1_mean, NMI_1_sd,
-                   ex_name))
+                   MI_mean, MI_sd, ex_name))
         f.close()
 
     return results

@@ -1,18 +1,26 @@
 """
-Script to train the VarPSOM model.
+Script to train the DPSOM model.
 """
 
 import uuid
 from datetime import date
-import tensorflow as tf
+
+try:
+    import tensorflow.compat.v1 as tf 
+    tf.disable_v2_behavior()
+except:
+    import tensorflow as tf
+
 from tqdm import tqdm
 import sacred
 from sacred.stflow import LogFileWriter
 from sklearn.model_selection import train_test_split
 import numpy as np
 from sklearn import metrics
-from VarPSOM_model import VarPSOM
+from DPSOM_model import DPSOM
 from utils import cluster_purity
+import os
+from os import path
 
 ex = sacred.Experiment("hyperopt")
 ex.observers.append(sacred.observers.FileStorageObserver.create("../sacred_runs"))
@@ -24,7 +32,7 @@ def ex_config():
     Params:
         num_epochs (int): Number of training epochs.
         batch_size (int): Batch size for the training.
-        latent_dim (int): Dimensionality of the VarPSOM's latent space.
+        latent_dim (int): Dimensionality of the DPSOM's latent space.
         som_dim (list): Dimensionality of the self-organizing map.
         learning_rate (float): Learning rate for the optimization.
         alpha (float): Student's t-distribution parameter.
@@ -54,7 +62,7 @@ def ex_config():
     som_dim = [8, 8]
     learning_rate = 0.001
     alpha = 10.0
-    beta = 20.0
+    beta = 0.25
     gamma = 20.0
     theta = 1
     epochs_pretrain = 15
@@ -73,6 +81,8 @@ def ex_config():
     convolution = False
     val_epochs = False
     more_runs = False
+    use_saved_pretrain = False
+    save_pretrain = False
 
 @ex.capture
 def get_data_generator(data_train, data_val, labels_train, labels_val, data_test, labels_test):
@@ -121,12 +131,12 @@ def get_data_generator(data_train, data_val, labels_train, labels_val, data_test
 
 
 @ex.capture
-def train_model(model, data_train, data_val, generator, lr_val, num_epochs, batch_size, logdir, ex_name,
-                val_epochs, modelpath, learning_rate, epochs_pretrain, som_dim, latent_dim):
+def train_model(model, data_train, data_val, generator, lr_val, num_epochs, batch_size, logdir, ex_name, validation,
+                val_epochs, modelpath, learning_rate, epochs_pretrain, som_dim, latent_dim, use_saved_pretrain, save_pretrain):
 
-    """Trains the VarPSOM model.
+    """Trains the DPSOM model.
     Args:
-        model (VarPSOM): VarPSOM model to train.
+        model (DPSOM): DPSOM model to train.
         data_train (np.array): Training set.
         data_val (np.array): Validation/test set.
         generator (generator): Data generator for the batches.
@@ -140,23 +150,27 @@ def train_model(model, data_train, data_val, generator, lr_val, num_epochs, batc
         learning_rate (float): Learning rate for the optimization.
         epochs_pretrain (int): Number of VAE pretraining epochs.
         som_dim (list): Dimensionality of the self-organizing map.
-        latent_dim (int): Dimensionality of the VarPSOM's latent space.
+        latent_dim (int): Dimensionality of the DPSOM's latent space.
     """
     epochs = 0
     iterations = 0
     train_gen = generator("train", batch_size)
-    val_gen = generator("val", batch_size)
+    if validation:
+        val_gen = generator("val", batch_size)
+    else:
+        val_gen = generator("test", batch_size)
     len_data_train = len(data_train)
     len_data_val = len(data_val)
     num_batches = len_data_train // batch_size
 
-    saver = tf.train.Saver(max_to_keep=1)
+    saver = tf.train.Saver(max_to_keep=5)
     summaries = tf.summary.merge_all()
 
     with tf.Session() as sess:
         sess.run(tf.global_variables_initializer())
         test_losses = []
         test_losses_mean = []
+        pretrainpath = "../models/pretrainVAE/VAE"
         with LogFileWriter(ex):
             train_writer = tf.summary.FileWriter(logdir + "/train", sess.graph)
             test_writer = tf.summary.FileWriter(logdir + "/test", sess.graph)
@@ -170,101 +184,107 @@ def train_model(model, data_train, data_val, generator, lr_val, num_epochs, batc
         print("\n**********Starting job {}********* \n".format(ex_name))
         pbar = tqdm(total=(num_epochs + epochs_pretrain + 40) * num_batches)
 
-        print("\n\nAutoencoder Pretraining...\n")
-        a = np.zeros((batch_size, som_dim[0] * som_dim[1]))
-        dp = {p: a, is_training: True, z: np.zeros((batch_size, latent_dim))}
-        for epoch in range(epochs_pretrain):
-            for i in range(num_batches):
-                batch_data, _, _ = next(train_gen)
-                f_dic = {x: batch_data, lr_val: learning_rate}
-                f_dic.update(dp)
-                train_step_vae.run(feed_dict=f_dic)
-                if i % 100 == 0:
-                    batch_val, _, _ = next(val_gen)
-                    f_dic = {x: batch_val}
+        if use_saved_pretrain:
+            print("\n\nUsing Saved Pretraining...\n")
+            saver.restore(sess, pretrainpath)
+        else:
+            print("\n\nAutoencoder Pretraining...\n")
+            a = np.zeros((batch_size, som_dim[0] * som_dim[1]))
+            dp = {p: a, is_training: True, z: np.zeros((batch_size, latent_dim))}
+            for epoch in range(epochs_pretrain):
+                for i in range(num_batches):
+                    batch_data, _, _ = next(train_gen)
+                    f_dic = {x: batch_data, lr_val: learning_rate}
                     f_dic.update(dp)
-                    test_loss, summary = sess.run([model.loss_reconstruction_ze, summaries], feed_dict=f_dic)
-                    test_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
-                    f_dic = {x: batch_data}
-                    f_dic.update(dp)
-                    train_loss, summary = sess.run([model.loss_reconstruction_ze, summaries], feed_dict=f_dic)
-                    train_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
-                pbar.set_postfix(epoch=epoch, train_loss=train_loss, test_loss=test_loss, refresh=False)
-                pbar.update(1)
+                    train_step_vae.run(feed_dict=f_dic)
+                    if i % 100 == 0:
+                        batch_val, _, _ = next(val_gen)
+                        f_dic = {x: batch_val}
+                        f_dic.update(dp)
+                        test_loss, summary = sess.run([model.loss_reconstruction_ze, summaries], feed_dict=f_dic)
+                        test_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
+                        f_dic = {x: batch_data}
+                        f_dic.update(dp)
+                        train_loss, summary = sess.run([model.loss_reconstruction_ze, summaries], feed_dict=f_dic)
+                        train_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
+                    pbar.set_postfix(epoch=epoch, train_loss=train_loss, test_loss=test_loss, refresh=False)
+                    pbar.update(1)
 
-        print("\n\nSOM initialization...\n")
-        for epoch in range(10):
-            for i in range(num_batches):
-                batch_data, _, ii = next(train_gen)
-                f_dic = {x: batch_data, lr_val: 0.9}
-                f_dic.update(dp)
-                train_step_som.run(feed_dict=f_dic)
-                if i % 100 == 0:
-                    batch_val, _, ii = next(val_gen)
-                    f_dic = {x: batch_val}
+            print("\n\nSOM initialization...\n")
+            for epoch in range(5):
+                for i in range(num_batches):
+                    batch_data, _, ii = next(train_gen)
+                    f_dic = {x: batch_data, lr_val: 0.9}
                     f_dic.update(dp)
-                    test_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
-                    test_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
-                    f_dic = {x: batch_data}
+                    train_step_som.run(feed_dict=f_dic)
+                    if i % 100 == 0:
+                        batch_val, _, ii = next(val_gen)
+                        f_dic = {x: batch_val}
+                        f_dic.update(dp)
+                        test_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
+                        test_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
+                        f_dic = {x: batch_data}
+                        f_dic.update(dp)
+                        train_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
+                        train_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
+                    pbar.set_postfix(epoch=epoch, train_loss=train_loss, test_loss=test_loss, refresh=False)
+                    pbar.update(1)
+            for epoch in range(5):
+                for i in range(num_batches):
+                    batch_data, _, ii = next(train_gen)
+                    f_dic = {x: batch_data, lr_val: 0.3}
                     f_dic.update(dp)
-                    train_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
-                    train_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
-                pbar.set_postfix(epoch=epoch, train_loss=train_loss, test_loss=test_loss, refresh=False)
-                pbar.update(1)
-        for epoch in range(10):
-            for i in range(num_batches):
-                batch_data, _, ii = next(train_gen)
-                f_dic = {x: batch_data, lr_val: 0.3}
-                f_dic.update(dp)
-                train_step_som.run(feed_dict=f_dic)
-                if i % 100 == 0:
-                    batch_val, _, ii = next(val_gen)
-                    f_dic = {x: batch_val}
+                    train_step_som.run(feed_dict=f_dic)
+                    if i % 100 == 0:
+                        batch_val, _, ii = next(val_gen)
+                        f_dic = {x: batch_val}
+                        f_dic.update(dp)
+                        test_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
+                        test_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
+                        f_dic = {x: batch_data}
+                        f_dic.update(dp)
+                        train_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
+                        train_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
+                    pbar.set_postfix(epoch=epoch, train_loss=train_loss, test_loss=test_loss, refresh=False)
+                    pbar.update(1)
+            for epoch in range(5):
+                for i in range(num_batches):
+                    batch_data, _, ii = next(train_gen)
+                    f_dic = {x: batch_data, lr_val: 0.1}
                     f_dic.update(dp)
-                    test_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
-                    test_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
-                    f_dic = {x: batch_data}
+                    train_step_som.run(feed_dict=f_dic)
+                    if i % 100 == 0:
+                        batch_val, _, ii = next(val_gen)
+                        f_dic = {x: batch_val}
+                        f_dic.update(dp)
+                        test_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
+                        test_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
+                        f_dic = {x: batch_data}
+                        f_dic.update(dp)
+                        train_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
+                        train_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
+                    pbar.set_postfix(epoch=epoch, train_loss=train_loss, test_loss=test_loss, refresh=False)
+                    pbar.update(1)
+            for epoch in range(5):
+                for i in range(num_batches):
+                    batch_data, _, ii = next(train_gen)
+                    f_dic = {x: batch_data, lr_val: 0.01}
                     f_dic.update(dp)
-                    train_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
-                    train_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
-                pbar.set_postfix(epoch=epoch, train_loss=train_loss, test_loss=test_loss, refresh=False)
-                pbar.update(1)
-        for epoch in range(10):
-            for i in range(num_batches):
-                batch_data, _, ii = next(train_gen)
-                f_dic = {x: batch_data, lr_val: 0.1}
-                f_dic.update(dp)
-                train_step_som.run(feed_dict=f_dic)
-                if i % 100 == 0:
-                    batch_val, _, ii = next(val_gen)
-                    f_dic = {x: batch_val}
-                    f_dic.update(dp)
-                    test_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
-                    test_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
-                    f_dic = {x: batch_data}
-                    f_dic.update(dp)
-                    train_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
-                    train_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
-                pbar.set_postfix(epoch=epoch, train_loss=train_loss, test_loss=test_loss, refresh=False)
-                pbar.update(1)
-        for epoch in range(10):
-            for i in range(num_batches):
-                batch_data, _, ii = next(train_gen)
-                f_dic = {x: batch_data, lr_val: 0.01}
-                f_dic.update(dp)
-                train_step_som.run(feed_dict=f_dic)
-                if i % 100 == 0:
-                    batch_val, _, ii = next(val_gen)
-                    f_dic = {x: batch_val}
-                    f_dic.update(dp)
-                    test_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
-                    test_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
-                    f_dic = {x: batch_data}
-                    f_dic.update(dp)
-                    train_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
-                    train_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
-                pbar.set_postfix(epoch=epoch, train_loss=train_loss, test_loss=test_loss, refresh=False)
-                pbar.update(1)
+                    train_step_som.run(feed_dict=f_dic)
+                    if i % 100 == 0:
+                        batch_val, _, ii = next(val_gen)
+                        f_dic = {x: batch_val}
+                        f_dic.update(dp)
+                        test_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
+                        test_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
+                        f_dic = {x: batch_data}
+                        f_dic.update(dp)
+                        train_loss, summary = sess.run([model.loss_a, summaries], feed_dict=f_dic)
+                        train_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
+                    pbar.set_postfix(epoch=epoch, train_loss=train_loss, test_loss=test_loss, refresh=False)
+                    pbar.update(1)
+            if save_pretrain:
+                saver.save(sess, pretrainpath)
 
         print("\n\nTraining...\n")
         for epoch in range(num_epochs):
@@ -338,14 +358,14 @@ def evaluate_model(model, generator, len_data_val, x, modelpath, epochs, batch_s
     mutual information adjusted mutual information score and purity.
 
     Args:
-        model (VarPSOM): Trained VarPSOM model to evaluate.
+        model (DPSOM): Trained DPSOM model to evaluate.
         generator (generator): Data generator for the batches.
         len_data_val (int): Length of validation set.
         x (tf.Tensor): Input tensor or placeholder.
         modelpath (path): Path from which to restore the model.
         epochs (int): number of epochs of training.
         batch_size (int): Batch size for the training.
-        latent_dim (int): Dimensionality of the VarPSOM's latent space.
+        latent_dim (int): Dimensionality of the DPSOM's latent space.
         som_dim (list): Dimensionality of the self-organizing map.
         learning_rate (float): Learning rate for the optimization.
         alpha (float): Student's t-distribution parameter.
@@ -414,7 +434,7 @@ def evaluate_model(model, generator, len_data_val, x, modelpath, epochs, batch_s
         else:
             f = open("results_MNIST.txt", "a+")
     f.write(
-            'Epochs= %d, som_dim=[%d,%d], latent_dim= %d, batch_size= %d, learning_rate= %f, beta=%d, gamma=%d, '
+            'Epochs= %d, som_dim=[%d,%d], latent_dim= %d, batch_size= %d, learning_rate= %f, beta=%f, gamma=%d, '
             'theta=%f, alpha=%f, dropout=%f, decay_factor=%f, prior_var=%f, prior=%f, epochs_pretrain=%d'
             % (epochs, som_dim[0], som_dim[1], latent_dim, batch_size, learning_rate, beta,
                gamma, theta, alpha, dropout, decay_factor, prior_var, prior, epochs_pretrain))
@@ -427,17 +447,21 @@ def evaluate_model(model, generator, len_data_val, x, modelpath, epochs, batch_s
 
 @ex.automain
 def main(latent_dim, som_dim, learning_rate, decay_factor, alpha, beta, gamma, theta, ex_name, more_runs, data_set,
-         dropout, prior_var, convolution, prior, validation):
+         dropout, prior_var, convolution, prior, validation, epochs_pretrain, num_epochs, batch_size):
     """Main method to build a model, train it and evaluate it.
     Returns:
         dict: Results of the evaluation (NMI, Purity).
     """
+
+    if not os.path.exists('../models'):
+        os.mkdir('../models')
+
     # Dimensions for MNIST-like data
     input_length = 28
     input_channels = 28
     lr_val = tf.placeholder_with_default(learning_rate, [])
 
-    model = VarPSOM(latent_dim=latent_dim, som_dim=som_dim, learning_rate=lr_val, alpha=alpha,
+    model = DPSOM(latent_dim=latent_dim, som_dim=som_dim, learning_rate=lr_val, alpha=alpha,
                     decay_factor=decay_factor, input_length=input_length, input_channels=input_channels, beta=beta,
                     theta=theta, gamma=gamma, convolution=convolution, dropout=dropout, prior_var=prior_var,
                     prior=prior)
@@ -481,6 +505,19 @@ def main(latent_dim, som_dim, learning_rate, decay_factor, alpha, beta, gamma, t
         PUR_mean = np.mean(PUR)
         PUR_sd = np.std(PUR) / np.sqrt(10)
         print("\nRESULTS NMI: %f +- %f, PUR: %f +- %f.  Name: %r. \n" % (NMI_mean, NMI_sd, PUR_mean, PUR_sd, ex_name))
+        if data_set == "MNIST":
+            f = open("evaluation_MNIST.txt", "a+")
+        else:
+            f = open("evaluation_fMNIST.txt", "a+")
+        f.write(
+            "som_dim=[%d,%d], latent_dim= %d, batch_size= %d, learning_rate= %f, theta= %f, "
+            "dropout=%f, prior=%f, gamma=%d, beta%f, epochs_pretrain=%d, epochs= %d"
+            % (som_dim[0], som_dim[1], latent_dim, batch_size, learning_rate, theta, dropout, prior,
+               gamma, beta, epochs_pretrain, num_epochs))
+
+        f.write(", RESULTS NMI: %f + %f, PUR: %f + %f.  Name: %r \n"
+                % (NMI_mean, NMI_sd, PUR_mean, PUR_sd, ex_name))
+        f.close()
     else:
         results = train_model(model, data_train, data_val, data_generator, lr_val)
         print("\n NMI: {}, AMI: {}, PUR: {}.  Name: %r.\n".format(results["NMI"], results["AMI"], results["Purity"],

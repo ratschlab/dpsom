@@ -1,2 +1,2 @@
-Computational pipeline used to reproduce the eICU pre-processed
-used in the Variational pSOM project.
+Computational pipeline used to reproduce the eICU pre-processed data
+used in the DPSOM project

@@ -1,5 +1,5 @@
 """
-Pre-processing functions for the VarTPSOM model, save data-set locally.
+Pre-processing functions for the T-DPSOM model, save data-set locally.
 """
 
 import parmap
