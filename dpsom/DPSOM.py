@@ -4,6 +4,7 @@ Script to train the DPSOM model.
 
 import uuid
 from datetime import date
+from pathlib import Path
 
 try:
     import tensorflow.compat.v1 as tf 
@@ -21,6 +22,10 @@ from DPSOM_model import DPSOM
 from utils import cluster_purity
 import os
 from os import path
+import time
+import random
+import csv
+import numpy.random as nprand
 
 ex = sacred.Experiment("hyperopt")
 ex.observers.append(sacred.observers.FileStorageObserver.create("../sacred_runs"))
@@ -61,9 +66,10 @@ def ex_config():
     latent_dim = 100
     som_dim = [8, 8]
     learning_rate = 0.001
+    learning_rate_pretrain = 0.001
     alpha = 10.0
     beta = 0.25
-    gamma = 20.0
+    gamma = 20
     theta = 1
     epochs_pretrain = 15
     decay_factor = 0.99
@@ -83,6 +89,10 @@ def ex_config():
     more_runs = False
     use_saved_pretrain = False
     save_pretrain = False
+    random_seed=2020
+
+    exp_output=False # Output to Google Cloud File System
+    exp_path="/home/mhueser/data/variational_psom/static_clustering_FMNIST/robustness"
 
 @ex.capture
 def get_data_generator(data_train, data_val, labels_train, labels_val, data_test, labels_test):
@@ -132,7 +142,8 @@ def get_data_generator(data_train, data_val, labels_train, labels_val, data_test
 
 @ex.capture
 def train_model(model, data_train, data_val, generator, lr_val, num_epochs, batch_size, logdir, ex_name, validation,
-                val_epochs, modelpath, learning_rate, epochs_pretrain, som_dim, latent_dim, use_saved_pretrain, save_pretrain):
+                val_epochs, modelpath, learning_rate, epochs_pretrain, som_dim, latent_dim, use_saved_pretrain,
+                learning_rate_pretrain, save_pretrain):
 
     """Trains the DPSOM model.
     Args:
@@ -194,7 +205,7 @@ def train_model(model, data_train, data_val, generator, lr_val, num_epochs, batc
             for epoch in range(epochs_pretrain):
                 for i in range(num_batches):
                     batch_data, _, _ = next(train_gen)
-                    f_dic = {x: batch_data, lr_val: learning_rate}
+                    f_dic = {x: batch_data, lr_val: learning_rate_pretrain}
                     f_dic.update(dp)
                     train_step_vae.run(feed_dict=f_dic)
                     if i % 100 == 0:
@@ -287,6 +298,9 @@ def train_model(model, data_train, data_val, generator, lr_val, num_epochs, batc
                 saver.save(sess, pretrainpath)
 
         print("\n\nTraining...\n")
+        lratios=[]
+        l2ratios=[]
+        l3ratios=[]
         for epoch in range(num_epochs):
             epochs += 1
             #Compute initial soft probabilities between data points and centroids
@@ -323,6 +337,15 @@ def train_model(model, data_train, data_val, generator, lr_val, num_epochs, batc
                     f_dic = {x: batch_data}
                     f_dic.update(ftrain)
                     train_loss, summary = sess.run([model.loss, summaries], feed_dict=f_dic)
+                    elbo_loss=sess.run([model.theta*model.loss_reconstruction_ze], feed_dict=f_dic)
+                    cah_loss=sess.run([model.gamma*model.loss_commit], feed_dict=f_dic)
+                    ssom_loss=sess.run([model.beta*model.loss_som], feed_dict=f_dic)
+                    cah_ssom_ratio=cah_loss[0]/ssom_loss[0]
+                    vae_cah_ratio=elbo_loss[0]/cah_loss[0]
+                    clust_vae_ratio=elbo_loss[0]/(ssom_loss[0]+cah_loss[0])
+                    lratios.append(cah_ssom_ratio)
+                    l2ratios.append(vae_cah_ratio)
+                    l3ratios.append(clust_vae_ratio)
                     train_writer.add_summary(summary, tf.train.global_step(sess, model.global_step))
                 if i % 1000 == 0:
                     test_loss_mean = np.mean(test_losses)
@@ -334,7 +357,9 @@ def train_model(model, data_train, data_val, generator, lr_val, num_epochs, batc
                 else:
                     test_s = test_losses_mean
 
-                pbar.set_postfix(epoch=epoch, train_loss=train_loss, test_loss=test_s, refresh=False)
+                pbar.set_postfix(epoch=epoch, train_loss=train_loss, test_loss=test_s,
+                                 ssom=ssom_loss, cah=cah_loss, vae=elbo_loss, cs_ratio=np.mean(lratios),
+                                 vc_ratio=np.mean(l2ratios), cr_ratio=np.mean(l3ratios), refresh=False)
                 pbar.update(1)
             saver.save(sess, modelpath)
 
@@ -411,7 +436,7 @@ def evaluate_model(model, generator, len_data_val, x, modelpath, epochs, batch_s
 
             test_k_all.extend(test_k)
 
-        test_nmi = metrics.normalized_mutual_info_score(np.array(labels_val_all), test_k_all)
+        test_nmi = metrics.normalized_mutual_info_score(np.array(labels_val_all), test_k_all, average_method='geometric')
         test_purity = cluster_purity(np.array(test_k_all), np.array(labels_val_all))
         test_ami = metrics.adjusted_mutual_info_score(test_k_all, labels_val_all)
 
@@ -434,7 +459,7 @@ def evaluate_model(model, generator, len_data_val, x, modelpath, epochs, batch_s
         else:
             f = open("results_MNIST.txt", "a+")
     f.write(
-            'Epochs= %d, som_dim=[%d,%d], latent_dim= %d, batch_size= %d, learning_rate= %f, beta=%f, gamma=%d, '
+            'Epochs= %d, som_dim=[%d,%d], latent_dim= %d, batch_size= %d, learning_rate= %f, beta=%f, gamma=%f, '
             'theta=%f, alpha=%f, dropout=%f, decay_factor=%f, prior_var=%f, prior=%f, epochs_pretrain=%d'
             % (epochs, som_dim[0], som_dim[1], latent_dim, batch_size, learning_rate, beta,
                gamma, theta, alpha, dropout, decay_factor, prior_var, prior, epochs_pretrain))
@@ -447,12 +472,20 @@ def evaluate_model(model, generator, len_data_val, x, modelpath, epochs, batch_s
 
 @ex.automain
 def main(latent_dim, som_dim, learning_rate, decay_factor, alpha, beta, gamma, theta, ex_name, more_runs, data_set,
-         dropout, prior_var, convolution, prior, validation, epochs_pretrain, num_epochs, batch_size):
+         dropout, prior_var, convolution, prior, validation, epochs_pretrain, num_epochs, batch_size, random_seed,
+         exp_output, exp_path):
     """Main method to build a model, train it and evaluate it.
     Returns:
         dict: Results of the evaluation (NMI, Purity).
     """
+    random.seed(random_seed)
+    nprand.seed(random_seed)
+    tf.random.set_random_seed(random_seed)
 
+    if exp_output:
+        Path(os.path.join(exp_path, "exp_beta_{:.4f}_gamma_{:.4f}_bsize_{}_seed_{}_epochs_{}.LOCK".format(beta,gamma,batch_size,random_seed,num_epochs))).touch()
+
+    start = time.time()
     if not os.path.exists('../models'):
         os.mkdir('../models')
 
@@ -511,7 +544,7 @@ def main(latent_dim, som_dim, learning_rate, decay_factor, alpha, beta, gamma, t
             f = open("evaluation_fMNIST.txt", "a+")
         f.write(
             "som_dim=[%d,%d], latent_dim= %d, batch_size= %d, learning_rate= %f, theta= %f, "
-            "dropout=%f, prior=%f, gamma=%d, beta%f, epochs_pretrain=%d, epochs= %d"
+            "dropout=%f, prior=%f, gamma=%f, beta%f, epochs_pretrain=%d, epochs= %d"
             % (som_dim[0], som_dim[1], latent_dim, batch_size, learning_rate, theta, dropout, prior,
                gamma, beta, epochs_pretrain, num_epochs))
 
@@ -522,4 +555,14 @@ def main(latent_dim, som_dim, learning_rate, decay_factor, alpha, beta, gamma, t
         results = train_model(model, data_train, data_val, data_generator, lr_val)
         print("\n NMI: {}, AMI: {}, PUR: {}.  Name: %r.\n".format(results["NMI"], results["AMI"], results["Purity"],
                                                                   ex_name))
+
+        if exp_output:
+            with open(os.path.join(exp_path, "exp_beta_{:.4f}_gamma_{:.4f}_bsize_{}_seed_{}_epochs_{}.tsv".format(beta,gamma,batch_size,random_seed,num_epochs)),'w') as out_fp:
+                csv_fp=csv.writer(out_fp)
+                csv_fp.writerow(["DATASET","NMI","AMI","Purity"])
+                csv_fp.writerow([data_set,str(results["NMI"]), str(results["AMI"]), str(results["Purity"])])
+            os.remove(os.path.join(exp_path, "exp_beta_{:.4f}_gamma_{:.4f}_bsize_{}_seed_{}_epochs_{}.LOCK".format(beta,gamma,batch_size,random_seed,num_epochs)))
+        
+        elapsed_time_fl = (time.time() - start)
+        print("\n Time: {}".format(elapsed_time_fl))
     return results

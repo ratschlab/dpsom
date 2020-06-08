@@ -47,7 +47,7 @@ class TDPSOM:
 
     def __init__(self, input_size, latent_dim=10, som_dim=[8, 8], learning_rate=1e-4, decay_factor=0.99,
                  decay_steps=2000, input_channels=98, alpha=10., beta=100., gamma=100., kappa=0.,
-                 theta=1., eta=1., dropout=0.5, prior=0.001):
+                 theta=1., eta=1., dropout=0.5, prior=0.001, lstm_dim=100):
 
         """Initialization method for the T-DPSOM model object.
         Args:
@@ -84,6 +84,8 @@ class TDPSOM:
         self.kappa = kappa
         self.dropout = dropout
         self.prior = prior
+        self.lstm_dim = lstm_dim
+        self.prior
         self.is_training
         self.inputs
         self.x
@@ -165,27 +167,32 @@ class TDPSOM:
             h_2 = tf.keras.layers.Dense(2000, activation=tf.nn.leaky_relu)(h_1)
             h_2 = tf.keras.layers.Dropout(rate=self.dropout)(h_2)
             h_2 = tf.keras.layers.BatchNormalization()(h_2)
-            z_e = tf.keras.layers.Dense(tfp.layers.MultivariateNormalTriL.params_size(self.latent_dim),activation=None)(h_2)
-            z_e = tfp.layers.MultivariateNormalTriL(self.latent_dim)(z_e)
+            z_e_mu = tf.keras.layers.Dense(self.latent_dim, activation=None)(h_2)
+            z_e_sigma = tf.keras.layers.Dense(self.latent_dim, activation=None)(h_2)
+            z_e = tfp.distributions.MultivariateNormalDiag(loc=z_e_mu, scale_diag=tfp.bijectors.Softplus()(z_e_sigma))
+            #z_e = tf.keras.layers.Dense(tfp.layers.MultivariateNormalTriL.params_size(self.latent_dim),activation=None)(h_2)
+            #z_e = tfp.layers.MultivariateNormalTriL(self.latent_dim)(z_e)
         return z_e
 
     @lazy_scope
     def z_e_sample(self):
         """Sample from the distribution of probability of the latent embeddings."""
-        z_e = tf.identity(self.z_e, name="z_e")
+        #z_e = tf.identity(self.z_e, name="z_e")
+        z_e = self.z_e.sample()
+        z_e = tf.identity(z_e, name="z_e")
         tf.summary.histogram("count_nonzeros_z_e", tf.count_nonzero(z_e, -1))
         return z_e
 
     @lazy_scope
     def z_e_old(self):
         """Aggregates the encodings of the respective previous time steps."""
-        z_e_old = tf.concat([self.z_e[0:1], self.z_e[:-1]], axis=0)
+        z_e_old = tf.concat([self.z_e_sample[0:1], self.z_e_sample[:-1]], axis=0)
         return z_e_old
 
     @lazy_scope
     def z_dist_flat(self):
         """Computes the distances between the centroids and the embeddings."""
-        z_dist = tf.squared_difference(tf.expand_dims(tf.expand_dims(self.z_e, 1), 1),
+        z_dist = tf.squared_difference(tf.expand_dims(tf.expand_dims(self.z_e_sample, 1), 1),
                                        tf.expand_dims(self.embeddings, 0))
         z_dist_red = tf.reduce_sum(z_dist, axis=-1)  # 1,32,8,8
         z_dist_flat = tf.reshape(z_dist_red, [-1, self.som_dim[0] * self.som_dim[0]])  # 1,32,64
@@ -195,7 +202,7 @@ class TDPSOM:
     def z_dist_flat_ng(self):
         """Computes the distances between the centroids and the embeddings stopping the gradient of the latent
         embeddings."""
-        z_dist = tf.squared_difference(tf.expand_dims(tf.expand_dims(tf.stop_gradient(self.z_e), 1), 1),
+        z_dist = tf.squared_difference(tf.expand_dims(tf.expand_dims(tf.stop_gradient(self.z_e_sample), 1), 1),
                                        tf.expand_dims(self.embeddings, 0))
         z_dist_red = tf.reduce_sum(z_dist, axis=-1)  # 1,32,8,8
         z_dist_flat = tf.reshape(z_dist_red, [-1, self.som_dim[0] * self.som_dim[1]])  # 1,32,64
@@ -213,19 +220,19 @@ class TDPSOM:
         """Predict the distribution of probability of the next embedding."""
         with tf.variable_scope("next_state"):
             z_e_p = tf.placeholder(tf.float32, shape=[None, self.latent_dim], name="input_lstm")
-            z_e = tf.cond(self.is_training, lambda: self.z_e, lambda: z_e_p)
+            z_e = tf.cond(self.is_training, lambda: self.z_e_sample, lambda: z_e_p)
 
             rnn_input = tf.stop_gradient(tf.reshape(z_e, [self.batch_size, self.step_size, self.latent_dim]))
-            init_state_p = tf.placeholder(tf.float32, shape=[2, None, 100], name="init_state")
+            init_state_p = tf.placeholder(tf.float32, shape=[2, None, self.lstm_dim], name="init_state")
 
-            cell = tf.keras.layers.CuDNNLSTM(100, return_sequences=True, return_state=True)
+            cell = tf.keras.layers.LSTM(self.lstm_dim, return_sequences=True, return_state=True)
             init_state = cell.get_initial_state(rnn_input)
             state = tf.cond(self.is_training, lambda: init_state, lambda: [init_state_p[0], init_state_p[1]])
             lstm_output, state_h, state_c = cell(rnn_input, initial_state=state)
             state = tf.identity([state_h, state_c], name="next_state")
-            lstm_output = tf.reshape(lstm_output, [self.batch_size*self.step_size, 100])
+            lstm_output = tf.reshape(lstm_output, [self.batch_size*self.step_size, self.lstm_dim])
 
-            h_1 = tf.keras.layers.Dense(100, activation=tf.nn.leaky_relu)(lstm_output)
+            h_1 = tf.keras.layers.Dense(self.lstm_dim, activation=tf.nn.leaky_relu)(lstm_output)
             next_z_e = tf.keras.layers.Dense(tfp.layers.IndependentNormal.params_size(self.latent_dim),
                                             activation=None)(h_1)
             next_z_e = tfp.layers.IndependentNormal(self.latent_dim)(next_z_e)
@@ -275,7 +282,7 @@ class TDPSOM:
         """Reconstructs the input from the encodings by learning a Gaussian distribution."""
         with tf.variable_scope("decoder", reuse=tf.AUTO_REUSE):
             z_p = tf.placeholder(tf.float32, shape=[None, self.latent_dim], name="z_e")
-            z_e = tf.cond(self.is_training, lambda: self.z_e, lambda: z_p)
+            z_e = tf.cond(self.is_training, lambda: self.z_e_sample, lambda: z_p)
 
             h_1 = tf.keras.layers.Dense(2000, activation=tf.nn.leaky_relu)(z_e)
             h_1 = tf.keras.layers.BatchNormalization()(h_1)
@@ -283,9 +290,14 @@ class TDPSOM:
             h_2 = tf.keras.layers.BatchNormalization()(h_2)
             h_3 = tf.keras.layers.Dense(500, activation=tf.nn.leaky_relu)(h_2)
             h_3 = tf.keras.layers.BatchNormalization()(h_3)
+
+            #x_hat = tf.keras.layers.Dense(self.input_channels)(h_3)
             x_hat = tf.keras.layers.Dense(tfp.layers.IndependentNormal.params_size(self.input_channels),
                                                 activation=None)(h_3)
             x_hat = tfp.layers.IndependentNormal(self.input_channels)(x_hat)
+            #x_hat = tf.keras.layers.Dense(tfp.layers.MultivariateNormalTriL.params_size(self.input_channels),
+            #                            activation=None)(h_3)
+            #x_hat = tfp.layers.MultivariateNormalTriL(self.input_channels)(x_hat)
         x_hat_sampled = tf.identity(x_hat, name="x_hat")
         return x_hat
 
@@ -295,6 +307,7 @@ class TDPSOM:
         prior = tfp.distributions.MultivariateNormalDiag(loc=tf.zeros(self.latent_dim), scale_diag=tf.ones(self.latent_dim))
         kl_loss = tf.reduce_mean(self.z_e.kl_divergence(prior))
         log_lik_loss = -tf.reduce_mean(self.reconstruction_e.log_prob(self.x))
+        #log_lik_loss = tf.keras.losses.MeanSquaredError()(self.reconstruction_e, self.x)
         loss_rec_mse_ze = self.prior * kl_loss + log_lik_loss
         tf.summary.scalar("log_lik_loss", log_lik_loss)
         tf.summary.scalar("kl_loss", kl_loss)
@@ -369,18 +382,18 @@ class TDPSOM:
                                   tf.expand_dims(q_right, -1), tf.expand_dims(q_left, -1)], axis=2)
         q_neighbours = tf.reduce_sum(tf.math.log(q_neighbours), axis=-1)
 
-        mask = tf.greater(self.q, 0.1 * tf.ones_like(self.q))
-        new_q = tf.multiply(self.q, tf.cast(mask, tf.float32))
+        #mask = tf.greater(self.q, 0.05 * tf.ones_like(self.q))
+        #new_q = tf.multiply(self.q, tf.cast(mask, tf.float32))
+        new_q = self.q
         q_n = tf.math.multiply(q_neighbours, tf.stop_gradient(new_q))
         q_n = tf.reduce_sum(q_n, axis=-1)
         qq = tf.math.negative(tf.reduce_mean(q_n))
-
         return qq
 
     @lazy_scope
     def loss_prediction(self):
         """Compute the prediction loss"""
-        z_e = tf.reshape(self.z_e, [self.batch_size, self.step_size, self.latent_dim])
+        z_e = tf.reshape(self.z_e_sample, [self.batch_size, self.step_size, self.latent_dim])
         z_e_next = tf.concat([z_e[:, 1:], tf.reshape(z_e[:, -1], [-1, 1, self.latent_dim])], axis=1)
         z_e_next = tf.stop_gradient(tf.reshape(z_e_next, [-1, self.latent_dim]))
         loss_prediction = - tf.reduce_mean(self.prediction.log_prob(z_e_next))
@@ -397,7 +410,7 @@ class TDPSOM:
         k_old = tf.reshape(tf.cast(k_old, tf.int64), [-1, 1])
         emb = tf.reshape(self.embeddings, [self.som_dim[0] * self.som_dim[1], self.latent_dim])
         e = tf.gather_nd(emb, k_old)
-        diff = tf.reduce_sum(tf.squared_difference(self.z_e, tf.stop_gradient(e)), axis=-1)
+        diff = tf.reduce_sum(tf.squared_difference(self.z_e_sample, tf.stop_gradient(e)), axis=-1)
         q = tf.keras.backend.epsilon() + (1.0 / (1.0 + diff/self.alpha) ** ((self.alpha + 1.0) / 2.0))
         loss_smoothness = - tf.reduce_mean(q)
         return loss_smoothness
@@ -418,7 +431,7 @@ class TDPSOM:
     @lazy_scope
     def loss_commit_sd(self):
         """Computes the commitment loss of standard SOM for initialization."""
-        loss_commit = tf.reduce_mean(tf.squared_difference(tf.stop_gradient(self.z_e), self.z_q))
+        loss_commit = tf.reduce_mean(tf.squared_difference(tf.stop_gradient(self.z_e_sample), self.z_q))
         tf.summary.scalar("loss_commit_sd", loss_commit)
         return loss_commit
 
@@ -426,7 +439,7 @@ class TDPSOM:
     def loss_som_old(self):
         """Computes the SOM loss."""
         loss_som = tf.reduce_mean(
-            tf.squared_difference(tf.expand_dims(tf.stop_gradient(self.z_e), axis=1), self.z_q_neighbors))
+            tf.squared_difference(tf.expand_dims(tf.stop_gradient(self.z_e_sample), axis=1), self.z_q_neighbors))
         tf.summary.scalar("loss_som_old", loss_som)
         return loss_som
 

@@ -153,6 +153,7 @@ class DPSOM:
                 dense3 = tf.keras.layers.Dense(2000, activation=tf.nn.leaky_relu)(dense2)
                 dense3 = tf.keras.layers.Dropout(rate=self.dropout)(dense3)
                 flattened = BatchNormalization()(dense3)
+                #flattened = dense3
             else:
                 inputs = tf.cast(self.inputs, tf.float32) - 0.5
                 conv1 = Conv2D(32, (3, 3), activation=tf.nn.leaky_relu, padding='same')(inputs)  # 28 x 28 x 32
@@ -170,7 +171,10 @@ class DPSOM:
                 flattened = tf.reshape(conv4, [-1, 7 * 7 * 256])
 
             z_e = Dense(tfp.layers.MultivariateNormalTriL.params_size(self.latent_dim), activation=None)(flattened)
+            #prior = tfp.distributions.Independent(tfp.distributions.Normal(loc=tf.zeros(self.latent_dim), scale=1),
+            #                                      reinterpreted_batch_ndims=1)
             z_e = tfp.layers.MultivariateNormalTriL(self.latent_dim)(z_e)
+                                                    #activity_regularizer=tfp.layers.KLDivergenceRegularizer(prior, weight=self.prior))(z_e)
         return z_e
 
     @lazy_scope
@@ -282,7 +286,7 @@ class DPSOM:
         tf.summary.scalar("loss_reconstruction_kl", kl_loss)
         log_lik_loss = -tf.reduce_mean(self.reconstruction_e.log_prob(self.inputs))
         tf.summary.scalar("loss_reconstruction_log_lik_loss", log_lik_loss)
-        loss_rec = self.prior*kl_loss + log_lik_loss
+        loss_rec = log_lik_loss + self.prior*kl_loss
         return loss_rec
 
     @lazy_scope
@@ -353,9 +357,11 @@ class DPSOM:
         q_left = tf.transpose(tf.gather_nd(q_t, tf.reshape(k_left, [self.som_dim[0] * self.som_dim[1], 1])))
         q_neighbours = tf.stack([q_up, q_down, q_right, q_left], axis=2)
         q_neighbours = tf.reduce_sum(tf.math.log(q_neighbours), axis=-1)
-        maxx = 0.1
-        mask = tf.greater_equal(self.q, maxx * tf.ones_like(self.q))
-        new_q = tf.multiply(self.q, tf.cast(mask, tf.float32))
+        # threshold
+        #maxx = 0.1
+        #mask = tf.greater_equal(self.q, maxx * tf.ones_like(self.q))
+        #new_q = tf.multiply(self.q, tf.cast(mask, tf.float32))
+        new_q = self.q
         q_n = tf.math.multiply(q_neighbours, tf.stop_gradient(new_q))
         q_n = tf.reduce_sum(q_n, axis=-1)
         qq = - tf.reduce_mean(q_n)
