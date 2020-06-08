@@ -87,11 +87,17 @@ It then saves the dataset in a csv table in `data/eICU_data.csv`.
 
 #### Training the model
 
-Once the data is saved in `data/eICU_data.csv` the entire model can be trained using:
+Once the data is saved in `data/eICU_data.csv`, the entire model can be trained using:
 
 `python TempDPSOM.py`
 
-It will output NMI clustering results using APACHE scores as labels.
+It will output NMI clustering results using APACHE scores as labels and save them in `results_eICU.txt`.
+
+Better prediction performances can be obtain with:
+
+`python TempDPSOM.py with latent_dim=100`
+
+It will save the prediction performances on the file `results_eICU_pred.txt`.
 
 To train the model without prediction, use:
 
@@ -101,5 +107,5 @@ To train the model without smoothness loss and without prediction, use:
 
 `python TempDPSOM.py with eta=0 kappa=0`
 
-Other experiments as computing prediction, heatmaps and trajectories can be found in `notebook/eICU_experiments.ipynb`.
+Other experiments as computing heatmaps and trajectories can be found in `notebook/eICU_experiments.ipynb`.
 
